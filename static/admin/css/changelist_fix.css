@@ -1,0 +1,328 @@
+
+/* ================================================================
+   CONSTRUCTION BILLING — ADMIN CHANGE LIST FIXES
+   Fixes search bar alignment, column widths, and button layouts
+   to match ProgressApp styling
+   ================================================================ */
+
+/* ---- ROOT FIX: Force search bar to top, prevent float overlap ---- */
+#changelist {
+    display: flex !important;
+    flex-direction: column !important;
+    width: 100% !important;
+}
+
+#changelist #toolbar {
+    order: -1 !important;
+    width: 100% !important;
+    float: none !important;
+    margin: 0 0 15px 0 !important;
+    padding: 8px 10px !important;
+    background: #f8f8f8 !important;
+    border: 1px solid #e0e0e0 !important;
+    border-radius: 4px !important;
+    box-sizing: border-box !important;
+    clear: both !important;
+}
+
+/* Search form layout */
+#changelist #toolbar form {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    width: 100% !important;
+    margin: 0 !important;
+}
+
+#changelist #toolbar form input[type="text"] {
+    flex: 1 !important;
+    max-width: 400px !important;
+    padding: 6px 10px !important;
+    font-size: 13px !important;
+    border: 1px solid #ccc !important;
+    border-radius: 3px !important;
+}
+
+#changelist #toolbar form input[type="submit"] {
+    padding: 6px 16px !important;
+    font-size: 13px !important;
+    background: #417690 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 3px !important;
+    cursor: pointer !important;
+}
+
+/* ---- FILTERS PANEL: Move below search, not beside ---- */
+#changelist-filter {
+    position: static !important;
+    float: none !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 0 15px 0 !important;
+    padding: 10px 15px !important;
+    background: #f8f8f8 !important;
+    border: 1px solid #e0e0e0 !important;
+    border-radius: 4px !important;
+    box-sizing: border-box !important;
+}
+
+/* If filters exist, make them horizontal/compact */
+#changelist-filter h2 {
+    font-size: 12px !important;
+    margin: 0 0 10px 0 !important;
+    padding: 0 !important;
+}
+
+#changelist-filter ul {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 8px 20px !important;
+    list-style: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+#changelist-filter li {
+    margin: 0 !important;
+}
+
+/* ---- RESULTS TABLE: Full width, proper column alignment ---- */
+#changelist .results {
+    width: 100% !important;
+    float: none !important;
+    clear: both !important;
+    margin: 0 !important;
+    overflow-x: auto !important;
+}
+
+#result_list {
+    width: 100% !important;
+    table-layout: auto !important;
+    border-collapse: collapse !important;
+}
+
+/* Header row styling to match ProgressApp */
+#result_list thead th {
+    background: #f0f0f0 !important;
+    color: #333 !important;
+    font-weight: 600 !important;
+    font-size: 11px !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.3px !important;
+    padding: 10px 8px !important;
+    border-bottom: 2px solid #ccc !important;
+    white-space: nowrap !important;
+    text-align: left !important;
+}
+
+#result_list thead th a {
+    color: #333 !important;
+    text-decoration: none !important;
+}
+
+/* Data rows */
+#result_list tbody td,
+#result_list tbody th {
+    padding: 8px !important;
+    font-size: 12px !important;
+    vertical-align: middle !important;
+    border-bottom: 1px solid #eaeaea !important;
+}
+
+#result_list tbody tr:hover {
+    background: #f5f5f5 !important;
+}
+
+/* ---- ACTION BUTTONS (Invoices, Analytics, Cost & P&L) ---- */
+/* Make buttons inline, compact, and aligned */
+#result_list td a.button {
+    display: inline-block !important;
+    padding: 3px 10px !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    text-decoration: none !important;
+    border-radius: 3px !important;
+    white-space: nowrap !important;
+    line-height: 1.4 !important;
+    margin: 1px 2px !important;
+    border: none !important;
+    text-align: center !important;
+    min-width: 55px !important;
+}
+
+/* Specific button colors */
+#result_list td a.button[href*="invoice"] {
+    background: #447e9b !important;
+    color: white !important;
+}
+
+#result_list td a.button[href*="analytics"] {
+    background: #6a1b9a !important;
+    color: white !important;
+}
+
+#result_list td a.button[href*="cost"] {
+    background: #d32f2f !important;
+    color: white !important;
+}
+
+/* ---- COLUMN WIDTH FIXES for Project list ---- */
+/* Project ID Code */
+#result_list th.column-project_id_code,
+#result_list td.field-project_id_code {
+    width: 60px !important;
+    min-width: 60px !important;
+    text-align: center !important;
+}
+
+/* Action buttons column */
+#result_list th.column-view_invoices,
+#result_list td.field-view_invoices,
+#result_list th.column-analytics_button,
+#result_list td.field-analytics_button,
+#result_list th.column-cost_profit_button,
+#result_list td.field-cost_profit_button {
+    width: 70px !important;
+    min-width: 70px !important;
+    text-align: center !important;
+}
+
+/* Project Name */
+#result_list th.column-project_name,
+#result_list td.field-project_name {
+    min-width: 180px !important;
+    max-width: 250px !important;
+}
+
+/* Client */
+#result_list th.column-client,
+#result_list td.field-client {
+    min-width: 140px !important;
+}
+
+/* PO Amount */
+#result_list th.column-fmt_po,
+#result_list td.field-fmt_po {
+    width: 110px !important;
+    min-width: 110px !important;
+    text-align: right !important;
+}
+
+/* BOQ Total */
+#result_list th.column-fmt_boq_total,
+#result_list td.field-fmt_boq_total {
+    width: 110px !important;
+    min-width: 110px !important;
+    text-align: right !important;
+}
+
+/* Is BOQ Complete */
+#result_list th.column-is_boq_complete,
+#result_list td.field-is_boq_complete {
+    width: 80px !important;
+    min-width: 80px !important;
+    text-align: center !important;
+}
+
+/* Advance % */
+#result_list th.column-fmt_advance,
+#result_list td.field-fmt_advance {
+    width: 60px !important;
+    min-width: 60px !important;
+    text-align: right !important;
+}
+
+/* Retention % */
+#result_list th.column-fmt_ret_a_pct,
+#result_list td.field-fmt_ret_a_pct,
+#result_list th.column-fmt_ret_b_pct,
+#result_list td.field-fmt_ret_b_pct {
+    width: 60px !important;
+    min-width: 60px !important;
+    text-align: right !important;
+}
+
+/* ---- ACTION BAR (top of results) ---- */
+#changelist .actions {
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    padding: 8px 0 !important;
+    margin: 0 0 10px 0 !important;
+    border-bottom: 1px solid #e0e0e0 !important;
+}
+
+#changelist .actions label {
+    font-size: 12px !important;
+    margin: 0 !important;
+}
+
+#changelist .actions select {
+    font-size: 12px !important;
+    padding: 4px 8px !important;
+}
+
+#changelist .actions button {
+    font-size: 12px !important;
+    padding: 4px 12px !important;
+}
+
+/* ---- PAGINATION ---- */
+#changelist .paginator {
+    margin-top: 15px !important;
+    font-size: 12px !important;
+    color: #666 !important;
+}
+
+/* ---- RESPONSIVE: Prevent horizontal scroll on small screens ---- */
+@media (max-width: 1200px) {
+    #result_list {
+        font-size: 11px !important;
+    }
+
+    #result_list td a.button {
+        padding: 2px 6px !important;
+        font-size: 10px !important;
+        min-width: 45px !important;
+    }
+}
+
+/* ---- CLEANUP: Remove any lingering float issues ---- */
+#changelist::after {
+    content: "" !important;
+    display: table !important;
+    clear: both !important;
+}
+
+/* Ensure the changelist-form doesn't have weird margins */
+#changelist-form {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+/* Fix for the "Add Project" button positioning */
+.object-tools {
+    position: static !important;
+    float: right !important;
+    margin: 0 0 15px 0 !important;
+}
+
+.object-tools a {
+    background: #417690 !important;
+    color: white !important;
+    padding: 8px 16px !important;
+    border-radius: 4px !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    text-decoration: none !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+}
+
+.object-tools a::before {
+    content: "+" !important;
+    font-size: 16px !important;
+    font-weight: bold !important;
+}

@@ -287,7 +287,8 @@ class Command(BaseCommand):
             pk = item['pk']
             f = item['fields']
             project = self.projects.get(f.get('project'))
-            obj = Invoice.objects.create(
+            # Create invoice WITHOUT calling save() to avoid auto-creating items
+            obj = Invoice(
                 project=project,
                 inv_type=f.get('inv_type', 'P'),
                 status=f.get('status', 'Draft'),
@@ -301,6 +302,9 @@ class Command(BaseCommand):
                 collection_date=self.to_date(f.get('collection_date')),
                 payment_date=self.to_date(f.get('payment_date'))
             )
+            # Use bulk_create or raw SQL to avoid Invoice.save() auto-creating items
+            Invoice.objects.bulk_create([obj])
+            obj = Invoice.objects.get(pk=obj.pk)
             self.invoices[pk] = obj
         self.stdout.write(self.style.SUCCESS(f"  -> {len(self.invoices)} invoices created"))
 
@@ -309,20 +313,20 @@ class Command(BaseCommand):
         self.stdout.write(f"Migrating Invoice Items... ({len(items)} found)")
         created = 0
         updated = 0
-        skipped = 0
         for item in items:
             f = item['fields']
             invoice = self.invoices.get(f.get('invoice'))
             boq_item = self.boq_items.get(f.get('boq_item'))
             if invoice and boq_item:
+                # Check if already exists (from Invoice.save() auto-creation)
                 existing = InvoiceItem.objects.filter(invoice=invoice, boq_item=boq_item).first()
                 if existing:
-                    # Update existing with correct values from JSON
+                    # Update with real values from JSON
                     existing.billing_method = f.get('billing_method', 'PCT')
                     existing.current_qty = self.to_decimal(f.get('current_qty'))
                     existing.current_percentage = self.to_decimal(f.get('current_percentage'))
                     existing.rate = self.to_decimal(f.get('rate'))
-                    existing.save()  # This will recalculate all computed fields
+                    existing.save()
                     updated += 1
                 else:
                     InvoiceItem.objects.create(
@@ -334,7 +338,7 @@ class Command(BaseCommand):
                         rate=self.to_decimal(f.get('rate'))
                     )
                     created += 1
-        self.stdout.write(self.style.SUCCESS(f"  -> {created} created, {updated} updated, {skipped} skipped"))
+        self.stdout.write(self.style.SUCCESS(f"  -> {created} created, {updated} updated"))
 
     def migrate_payroll_records(self):
         items = self.get_items('sales.payrollrecord')
@@ -344,7 +348,7 @@ class Command(BaseCommand):
             f = item['fields']
             employee = self.employees.get(f.get('employee'))
             if employee:
-                # Create with minimal fields first to get a PK
+                # Create with bulk_create to get PK without triggering save()
                 obj = PayrollRecord(
                     employee=employee,
                     month=self.to_date(f.get('month')) or date.today().replace(day=1),
@@ -353,11 +357,15 @@ class Command(BaseCommand):
                     overtime_hours=self.to_decimal(f.get('overtime_hours')),
                     is_allocated=f.get('is_allocated', False)
                 )
-                # Save without calling the full save() logic that needs cost_centers
                 PayrollRecord.objects.bulk_create([obj])
                 obj = PayrollRecord.objects.get(pk=obj.pk)
                 self.payroll_records[pk] = obj
-        self.stdout.write(self.style.SUCCESS(f"  -> {len(self.payroll_records)} payroll records created"))
+
+        # Now that all PayrollRecords have PKs, call save() to compute snapshot fields
+        self.stdout.write("Recalculating payroll snapshots...")
+        for rec in PayrollRecord.objects.all():
+            rec.save()
+        self.stdout.write(self.style.SUCCESS(f"  -> {len(self.payroll_records)} payroll records created & calculated"))
 
     def migrate_payroll_cost_centers(self):
         items = self.get_items('sales.payrollcostcenter')
@@ -376,6 +384,11 @@ class Command(BaseCommand):
                     bonus=self.to_decimal(f.get('bonus')),
                     notes=f.get('notes', '')
                 )
+
+        # Re-save payroll records after cost centers are added (affects days_absent calc)
+        self.stdout.write("Re-calculating payroll with cost centers...")
+        for rec in PayrollRecord.objects.all():
+            rec.save()
 
     def migrate_payroll_allocations(self):
         items = self.get_items('sales.payrollallocation')

@@ -35,19 +35,19 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
 DEBUG = os.getenv('DEBUG', 'True').lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = [h.strip() for h in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if h.strip()]
+ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '192.168.1.185']
 
 # ---------------------------------------------------------------------------
 # APPS
 # ---------------------------------------------------------------------------
 INSTALLED_APPS = [
+    'billing',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'billing',
 ]
 
 MIDDLEWARE = [
@@ -112,6 +112,9 @@ USE_TZ = True
 # STATIC & MEDIA
 # ---------------------------------------------------------------------------
 STATIC_URL = os.getenv('STATIC_URL', '/static/')
+STATICFILES_DIRS = [
+    BASE_DIR / "billing" / "static",
+]
 STATIC_ROOT = BASE_DIR / os.getenv('STATIC_ROOT', 'staticfiles')
 
 MEDIA_URL = os.getenv('MEDIA_URL', '/media/')

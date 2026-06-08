@@ -1,0 +1,267 @@
+{% extends "admin/base_site.html" %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+/* ================================================================
+   CONSTRUCTION BILLING — ADMIN CHANGE LIST FIXES (INLINE)
+   ================================================================ */
+
+/* ---- ROOT FIX: Force search bar to top, prevent float overlap ---- */
+#changelist {
+    display: flex !important;
+    flex-direction: column !important;
+    width: 100% !important;
+}
+
+#changelist #toolbar {
+    order: -1 !important;
+    width: 100% !important;
+    float: none !important;
+    margin: 0 0 15px 0 !important;
+    padding: 8px 10px !important;
+    background: #f8f8f8 !important;
+    border: 1px solid #e0e0e0 !important;
+    border-radius: 4px !important;
+    box-sizing: border-box !important;
+    clear: both !important;
+}
+
+/* Search form layout */
+#changelist #toolbar form {
+    display: flex !important;
+    align-items: center !important;
+    gap: 8px !important;
+    width: 100% !important;
+    margin: 0 !important;
+}
+
+#changelist #toolbar form input[type="text"] {
+    flex: 1 !important;
+    max-width: 400px !important;
+    padding: 6px 10px !important;
+    font-size: 13px !important;
+    border: 1px solid #ccc !important;
+    border-radius: 3px !important;
+}
+
+#changelist #toolbar form input[type="submit"] {
+    padding: 6px 16px !important;
+    font-size: 13px !important;
+    background: #417690 !important;
+    color: white !important;
+    border: none !important;
+    border-radius: 3px !important;
+    cursor: pointer !important;
+}
+
+/* ---- FILTERS PANEL: Move below search, not beside ---- */
+#changelist-filter {
+    position: static !important;
+    float: none !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    margin: 0 0 15px 0 !important;
+    padding: 10px 15px !important;
+    background: #f8f8f8 !important;
+    border: 1px solid #e0e0e0 !important;
+    border-radius: 4px !important;
+    box-sizing: border-box !important;
+}
+
+#changelist-filter h2 {
+    font-size: 12px !important;
+    margin: 0 0 10px 0 !important;
+    padding: 0 !important;
+}
+
+#changelist-filter ul {
+    display: flex !important;
+    flex-wrap: wrap !important;
+    gap: 8px 20px !important;
+    list-style: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+#changelist-filter li {
+    margin: 0 !important;
+}
+
+/* ---- RESULTS TABLE: Full width, proper column alignment ---- */
+#changelist .results {
+    width: 100% !important;
+    float: none !important;
+    clear: both !important;
+    margin: 0 !important;
+    overflow-x: auto !important;
+}
+
+#result_list {
+    width: 100% !important;
+    table-layout: auto !important;
+    border-collapse: collapse !important;
+}
+
+/* Header row styling */
+#result_list thead th {
+    background: #f0f0f0 !important;
+    color: #333 !important;
+    font-weight: 600 !important;
+    font-size: 11px !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.3px !important;
+    padding: 10px 8px !important;
+    border-bottom: 2px solid #ccc !important;
+    white-space: nowrap !important;
+    text-align: left !important;
+}
+
+#result_list thead th a {
+    color: #333 !important;
+    text-decoration: none !important;
+}
+
+/* Data rows */
+#result_list tbody td,
+#result_list tbody th {
+    padding: 8px !important;
+    font-size: 12px !important;
+    vertical-align: middle !important;
+    border-bottom: 1px solid #eaeaea !important;
+}
+
+#result_list tbody tr:hover {
+    background: #f5f5f5 !important;
+}
+
+/* ---- ACTION BUTTONS ---- */
+#result_list td a.button {
+    display: inline-block !important;
+    padding: 3px 10px !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    text-decoration: none !important;
+    border-radius: 3px !important;
+    white-space: nowrap !important;
+    line-height: 1.4 !important;
+    margin: 1px 2px !important;
+    border: none !important;
+    text-align: center !important;
+    min-width: 55px !important;
+}
+
+/* ---- COLUMN WIDTH FIXES ---- */
+#result_list th.column-project_id_code,
+#result_list td.field-project_id_code {
+    width: 60px !important;
+    min-width: 60px !important;
+    text-align: center !important;
+}
+
+#result_list th.column-action_buttons,
+#result_list td.field-action_buttons {
+    width: 200px !important;
+    min-width: 200px !important;
+    text-align: center !important;
+}
+
+#result_list th.column-project_name,
+#result_list td.field-project_name {
+    min-width: 180px !important;
+    max-width: 250px !important;
+}
+
+#result_list th.column-client,
+#result_list td.field-client {
+    min-width: 140px !important;
+}
+
+#result_list th.column-fmt_po,
+#result_list td.field-fmt_po {
+    width: 110px !important;
+    min-width: 110px !important;
+    text-align: right !important;
+}
+
+#result_list th.column-fmt_boq_total,
+#result_list td.field-fmt_boq_total {
+    width: 110px !important;
+    min-width: 110px !important;
+    text-align: right !important;
+}
+
+#result_list th.column-is_boq_complete,
+#result_list td.field-is_boq_complete {
+    width: 80px !important;
+    min-width: 80px !important;
+    text-align: center !important;
+}
+
+#result_list th.column-fmt_advance,
+#result_list td.field-fmt_advance,
+#result_list th.column-fmt_ret_a_pct,
+#result_list td.field-fmt_ret_a_pct,
+#result_list th.column-fmt_ret_b_pct,
+#result_list td.field-fmt_ret_b_pct {
+    width: 60px !important;
+    min-width: 60px !important;
+    text-align: right !important;
+}
+
+/* ---- ACTION BAR ---- */
+#changelist .actions {
+    display: flex !important;
+    align-items: center !important;
+    gap: 10px !important;
+    padding: 8px 0 !important;
+    margin: 0 0 10px 0 !important;
+    border-bottom: 1px solid #e0e0e0 !important;
+}
+
+/* ---- OBJECT TOOLS (Add button) ---- */
+.object-tools {
+    position: static !important;
+    float: right !important;
+    margin: 0 0 15px 0 !important;
+}
+
+.object-tools a {
+    background: #417690 !important;
+    color: white !important;
+    padding: 8px 16px !important;
+    border-radius: 4px !important;
+    font-size: 12px !important;
+    font-weight: 600 !important;
+    text-decoration: none !important;
+    display: inline-flex !important;
+    align-items: center !important;
+    gap: 6px !important;
+}
+
+/* ---- CLEAR FIXES ---- */
+#changelist::after {
+    content: "" !important;
+    display: table !important;
+    clear: both !important;
+}
+
+#changelist-form {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+/* ---- RESPONSIVE ---- */
+@media (max-width: 1200px) {
+    #result_list {
+        font-size: 11px !important;
+    }
+
+    #result_list td a.button {
+        padding: 2px 6px !important;
+        font-size: 10px !important;
+        min-width: 45px !important;
+    }
+}
+</style>
+{% endblock %}

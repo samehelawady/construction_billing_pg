@@ -28,6 +28,11 @@ from .utils import money
 # =============================================================================
 
 class DynamicAdminSite(AdminSite):
+    """Custom admin site with company branding and template overrides for layout fixes."""
+
+    # Template overrides - these point to our custom templates directory
+    # The base_site.html template contains CSS fixes for the search bar positioning
+
     def each_context(self, request):
         context = super().each_context(request)
         company = CompanyProfile.get_active()
@@ -600,35 +605,37 @@ class ExpenseInline(admin.TabularInline):
 class ProjectAdmin(admin.ModelAdmin):
     inlines = [BOQItemInline, ExpenseInline]
     list_display = [
-        "project_id_code", "view_invoices", "analytics_button", "cost_profit_button",
-        "project_name", "client", "fmt_po",
+        "project_id_code", "action_buttons", "project_name", "client", "fmt_po",
         "fmt_boq_total", "is_boq_complete", "fmt_advance",
         "fmt_ret_a_pct", "fmt_ret_b_pct"
     ]
     readonly_fields = ["is_boq_complete"]
     search_fields = ["project_id_code", "project_name"]
 
-    def view_invoices(self, obj):
+    # ---- FIXED: Single column with all 3 buttons inline ----
+    def action_buttons(self, obj):
+        """Combine all action buttons into one compact cell to prevent column misalignment."""
         app_label = obj._meta.app_label
-        url = reverse(f'admin:{app_label}_invoice_changelist') + f'?project__id__exact={obj.id}'
-        return format_html(
-            '<a class="button" href="{}" style="background:#447e9b; color:white; padding: 2px 8px; border-radius: 4px; font-size:10px;">Invoices</a>',
-            url)
-    view_invoices.short_description = "Action"
+        invoices_url = reverse(f'admin:{app_label}_invoice_changelist') + f'?project__id__exact={obj.id}'
+        analytics_url = reverse('admin:project_analytics', args=[obj.pk])
+        cost_url = reverse('admin:project_cost_profit', args=[obj.pk])
 
-    def analytics_button(self, obj):
-        url = reverse('admin:project_analytics', args=[obj.pk])
         return format_html(
-            '<a class="button" href="{}" target="_blank" style="background:#6a1b9a; color:white; padding: 2px 8px; border-radius: 4px; font-size:10px;">Analytics</a>',
-            url)
-    analytics_button.short_description = "Analytics"
-
-    def cost_profit_button(self, obj):
-        url = reverse('admin:project_cost_profit', args=[obj.pk])
-        return format_html(
-            '<a class="button" href="{}" target="_blank" style="background:#d32f2f; color:white; padding: 2px 8px; border-radius: 4px; font-size:10px;">Cost & P&L</a>',
-            url)
-    cost_profit_button.short_description = "Cost"
+            '<div style="display:flex; gap:4px; justify-content:center; flex-wrap:nowrap;">'
+            '<a class="button" href="{}" style="background:#447e9b; color:white; padding:3px 8px; '
+            'border-radius:3px; font-size:10px; font-weight:600; text-decoration:none; '
+            'white-space:nowrap; line-height:1.4; border:none; min-width:50px; text-align:center;">Invoices</a>'
+            '<a class="button" href="{}" target="_blank" style="background:#6a1b9a; color:white; padding:3px 8px; '
+            'border-radius:3px; font-size:10px; font-weight:600; text-decoration:none; '
+            'white-space:nowrap; line-height:1.4; border:none; min-width:50px; text-align:center;">Analytics</a>'
+            '<a class="button" href="{}" target="_blank" style="background:#d32f2f; color:white; padding:3px 8px; '
+            'border-radius:3px; font-size:10px; font-weight:600; text-decoration:none; '
+            'white-space:nowrap; line-height:1.4; border:none; min-width:50px; text-align:center;">Cost &amp; P&amp;L</a>'
+            '</div>',
+            invoices_url, analytics_url, cost_url
+        )
+    action_buttons.short_description = "Actions"
+    action_buttons.admin_order_field = "project_id_code"
 
     def _logo_bar(self, logo_url):
         if logo_url:
@@ -653,6 +660,7 @@ class ProjectAdmin(admin.ModelAdmin):
         grand_expenses = Decimal("0")
         grand_profit = Decimal("0")
 
+        # 1. CALCULATE TOTAL MANPOWER COST FOR THE PROJECT
         total_manpower = Decimal("0")
 
         for cc in PayrollCostCenter.objects.filter(
@@ -695,6 +703,7 @@ class ProjectAdmin(admin.ModelAdmin):
                         )
                         total_manpower += payroll_portion + admin_portion
 
+        # 2. ALLOCATE TOTAL MANPOWER TO BOQ ITEMS BY PROGRESS PERCENTAGE
         boq_manpower = {}
         total_work = latest_inv.cumulative_work_done if latest_inv else Decimal("0")
         total_boq_value = sum(b.quantity * b.rate for b in boq_items)
@@ -715,6 +724,7 @@ class ProjectAdmin(admin.ModelAdmin):
 
             boq_manpower[boq.id] = money(total_manpower * pct)
 
+        # 3. BUILD REPORT ROWS
         for boq in boq_items:
             inv_items = InvoiceItem.objects.filter(
                 boq_item=boq,
@@ -879,7 +889,6 @@ class ProjectAdmin(admin.ModelAdmin):
     </body></html>"""
         return HttpResponse(html)
 
-
     def analytics_view(self, request, pk):
         proj = get_object_or_404(Project, pk=pk)
         invoices = Invoice.objects.filter(project=proj).order_by('inv_number')
@@ -975,7 +984,7 @@ class ProjectAdmin(admin.ModelAdmin):
             boq_total += line_total
             boq_rows += f"""<tr>
                 <td>{b.item_number}</td>
-                <td>{b.description[:50]}</td>
+                <td>{b.description[:1500]}</td>
                 <td>{b.unit}</td>
                 <td class='num'>{b.quantity:,.2f}</td>
                 <td class='num'>{b.rate:,.2f}</td>
