@@ -604,9 +604,9 @@ class Employee(models.Model):
     transport_allowance = models.DecimalField(max_digits=15, decimal_places=2, default=0)
     other_allowances = models.DecimalField(max_digits=15, decimal_places=2, default=0)
 
-    annual_benefits = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Annual benefits")
-    annual_eid_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Annual Emirates ID")
-    annual_visa_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Annual Visa")
+    annual_benefits = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Annual Benefits")
+    annual_eid_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Annual Housing")
+    annual_visa_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Annual RP Cost")
     annual_ticket_cost = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Annual Tickets")
 
     date_joined = models.DateField(default=date.today)
@@ -653,14 +653,17 @@ class Employee(models.Model):
         """
         End of Service (EOS) benefits.
         - Less than 1 year of service: 0
-        - Years 1 to 3: 21 days of basic salary per completed year
-        - Year 4 onwards: 30 days of basic salary per completed year
-        - Current partial year is prorated by days attended.
+        - 1 to 3 years: 21 days of basic salary per year of service
+        - More than 3 years: 30 days of basic salary per year of service
+        - Fractions of a year are prorated by calendar days
+        - All calculations are based on basic salary only
         """
         if not self.date_joined or not self.is_active:
             return Decimal("0.00")
 
         today = date.today()
+
+        # Calculate completed full years
         completed_years = today.year - self.date_joined.year
         if (today.month, today.day) < (self.date_joined.month, self.date_joined.day):
             completed_years -= 1
@@ -668,18 +671,22 @@ class Employee(models.Model):
         if completed_years < 1:
             return Decimal("0.00")
 
+        # Daily basic salary (30-day month basis)
         daily_basic = self.basic_salary / Decimal("30")
         total_eos = Decimal("0")
 
+        # Completed full years entitlement
         for year in range(1, completed_years + 1):
             if year <= 3:
                 total_eos += daily_basic * Decimal("21")
             else:
                 total_eos += daily_basic * Decimal("30")
 
+        # Prorated entitlement for the current partial year
         try:
             last_anniversary = date(today.year, self.date_joined.month, self.date_joined.day)
         except ValueError:
+            # Feb 29 on non-leap year
             last_anniversary = date(today.year, self.date_joined.month, 28)
 
         if last_anniversary > today:
@@ -688,21 +695,26 @@ class Employee(models.Model):
             except ValueError:
                 last_anniversary = date(today.year - 1, self.date_joined.month, 28)
 
-        days_in_current_year = (today - last_anniversary).days
+        days_elapsed = (today - last_anniversary).days
 
-        if days_in_current_year > 0:
-            year_num = completed_years + 1
-            if year_num <= 3:
-                entitlement = daily_basic * Decimal("21")
+        if days_elapsed > 0:
+            # Rate for the current year
+            current_year_num = completed_years + 1
+            if current_year_num <= 3:
+                yearly_entitlement = daily_basic * Decimal("21")
             else:
-                entitlement = daily_basic * Decimal("30")
+                yearly_entitlement = daily_basic * Decimal("30")
 
-            year_absence = Decimal("0")
-            for pr in self.payroll_records.filter(month__gte=last_anniversary, month__lte=today):
-                year_absence += Decimal(str(pr.days_absent))
+            # Total days in this service year (365 or 366)
+            try:
+                next_anniversary = date(today.year + 1, self.date_joined.month, self.date_joined.day)
+            except ValueError:
+                next_anniversary = date(today.year + 1, self.date_joined.month, 28)
 
-            attended_days = max(0, days_in_current_year - int(year_absence))
-            total_eos += entitlement * Decimal(attended_days) / Decimal(days_in_current_year)
+            days_in_year = (next_anniversary - last_anniversary).days
+
+            # Prorate: entitlement × (elapsed days / days in year)
+            total_eos += yearly_entitlement * Decimal(days_elapsed) / Decimal(days_in_year)
 
         return money(total_eos)
 
@@ -861,6 +873,7 @@ class PayrollRecord(models.Model):
         return money((self.total_salary_snap + self.overtime_amount_snap + self.employee.monthly_admin_cost) / Decimal("30"))
 
     def save(self, *args, **kwargs):
+        # 1. Set all snap fields that don't require DB queries first
         self.basic_salary_snap = self.employee.basic_salary
         self.housing_allowance_snap = self.employee.housing_allowance
         self.transport_allowance_snap = self.employee.transport_allowance
@@ -868,17 +881,30 @@ class PayrollRecord(models.Model):
         self.total_salary_snap = self.employee.total_salary
         self.overtime_amount_snap = self.overtime_amount
 
+        # 2. Save to get a PK (required for reverse FK queries)
+        super().save(*args, **kwargs)
+
+        # 3. Now safe to query related objects
         cc_ot = Decimal("0")
         try:
-            cc_ot = self.cost_centers.aggregate(total=Sum('overtime_hours'))['total'] or Decimal("0")
+            if self.pk:  # Extra safety check
+                cc_ot = self.cost_centers.aggregate(total=Sum('overtime_hours'))['total'] or Decimal("0")
         except Exception:
             pass
+
         if cc_ot > 0 and self.employee.hourly_rate_ot > 0:
             self.overtime_amount_snap = money(self.overtime_amount + (cc_ot * self.employee.hourly_rate_ot))
 
         self.absence_deduction_snap = self.absence_deduction
         self.net_salary_snap = self.net_salary
-        super().save(*args, **kwargs)
+
+        # 4. Save again with the updated calculated fields
+        # Use update_fields to avoid recursion and unnecessary DB hits
+        super().save(
+            update_fields=[
+                'overtime_amount_snap', 'absence_deduction_snap', 'net_salary_snap'
+            ]
+        )
 
 
 class PayrollCostCenter(models.Model):

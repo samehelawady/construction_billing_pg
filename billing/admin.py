@@ -1682,8 +1682,8 @@ class EmployeeAdminForm(forms.ModelForm):
             'transport_allowance': 'Transport Allowance',
             'other_allowances': 'Other Allowances',
             'annual_benefits': 'Annual Benefits',
-            'annual_eid_cost': 'Annual EID Cost',
-            'annual_visa_cost': 'Annual Visa Cost',
+            'annual_eid_cost': 'Annual Housing Cost',
+            'annual_visa_cost': 'Annual Resident Permit Cost',
             'annual_ticket_cost': 'Annual Tickets',
             'total_salary': 'Total Salary',
             'monthly_admin_cost': 'Monthly Admin Cost',
@@ -1738,7 +1738,7 @@ class EmployeeAdmin(admin.ModelAdmin):
             "description": (
                 "Daily Cost = (Total Salary + Admin Cost) / 30. "
                 "Hourly OT Rate = Total Salary / 30 / 8 (Site workers only). "
-                "EOS = End of Service benefits (21 days/years 1-3, 30 days/year 4+)."
+                "EOSB = End of Service Benefits (21 days/years 1-3, 30 days/year 4+)."
             ),
         }),
         ("Bank Details", {
@@ -1765,7 +1765,7 @@ class EmployeeAdmin(admin.ModelAdmin):
         except Exception as e:
             logger.error(f"DEBUG EOS ERROR for {obj}: {e}", exc_info=True)
             return mark_safe(f'<span style="color:red; font-weight:bold;">ERROR: {str(e)[:40]}</span>')
-    display_eos.short_description = "EOS (End of Service)"
+    display_eos.short_description = "EOSB (End of Service Benefit)"
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)
@@ -1990,9 +1990,6 @@ class PayrollRecordAdmin(admin.ModelAdmin):
             rec.save()
         self.message_user(request, f"Recalculated {queryset.count()} record(s).")
 
-    def save_related(self, request, form, formsets, change):
-        super().save_related(request, form, formsets, change)
-        form.instance.save()
 
     def changelist_view(self, request, extra_context=None):
         today = date.today()
