@@ -102,7 +102,7 @@ class ClientAdmin(admin.ModelAdmin):
     * {{ box-sizing: border-box; margin:0; padding:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
     body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 10px; color: #222; padding: 10px; }}
     .logo-bar {{ text-align: right; margin-bottom: 6px; }}
-    .logo-bar img {{ max-height: 60px; max-width: 180px; object-fit: contain; }}
+    .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
     .report-title {{ font-size: 18px; font-weight: bold; text-align: center; color: #000080; margin-bottom: 4px; }}
     .report-subtitle {{ font-size: 12px; text-align: center; color: #666; margin-bottom: 15px; }}
     .meta-box {{ background: #f5f5f5; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; line-height: 1.6; font-size: 10px; }}
