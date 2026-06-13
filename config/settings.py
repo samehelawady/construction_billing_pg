@@ -58,6 +58,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'billing.middleware.ActiveCompanyMiddleware',  # your app path
 ]
 
 ROOT_URLCONF = 'config.urls'

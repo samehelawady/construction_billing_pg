@@ -24,18 +24,91 @@ from .utils import money
 
 
 # =============================================================================
+# COMPANY SCOPING MIXIN
+# =============================================================================
+
+class CompanyScopedAdminMixin:
+    company_field_path = None
+
+    def get_active_company(self, request):
+        return CompanyProfile.get_active(request)
+
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        company = self.get_active_company(request)
+
+        # During transition: if no active company, show all data
+        if not company:
+            return qs
+
+        if self.company_field_path and not getattr(request.user, 'is_superuser', False):
+            # Include records with matching company OR null company
+            null_filter = {self.company_field_path + '__isnull': True}
+            qs = qs.filter(
+                Q(**{self.company_field_path: company}) | Q(**null_filter)
+            )
+        return qs
+
+    def get_object_or_404_scoped(self, request, model, **kwargs):
+        """Get object through the scoped queryset, with fallback."""
+        qs = self.get_queryset(request).filter(**kwargs)
+        try:
+            return qs.get()
+        except model.DoesNotExist:
+            # Fallback for transition period
+            try:
+                return model.objects.get(**kwargs)
+            except model.DoesNotExist:
+                from django.http import Http404
+                raise Http404(f"No {model._meta.verbose_name} matches the given query.")
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        company = self.get_active_company(request)
+        if company:
+            if db_field.name == 'company':
+                kwargs['queryset'] = CompanyProfile.objects.filter(is_active=True)
+            elif db_field.name == 'client':
+                kwargs['queryset'] = Client.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+            elif db_field.name == 'project':
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+            elif db_field.name == 'employee':
+                kwargs['queryset'] = Employee.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+            elif db_field.name == 'pricing_project':
+                kwargs['queryset'] = PricingProject.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+            elif db_field.name == 'reference_boq_item':
+                kwargs['queryset'] = BOQItem.objects.filter(
+                    Q(project__company=company) | Q(project__company__isnull=True)
+                )
+            elif db_field.name == 'reference_projects':
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def save_model(self, request, obj, form, change):
+        company = self.get_active_company(request)
+        if company and hasattr(obj, 'company') and not obj.company_id:
+            if hasattr(obj, 'project') and obj.project and hasattr(obj.project, 'company'):
+                obj.company = obj.project.company
+            else:
+                obj.company = company
+        super().save_model(request, obj, form, change)
+# =============================================================================
 # DYNAMIC ADMIN SITE
 # =============================================================================
 
 class DynamicAdminSite(AdminSite):
-    """Custom admin site with company branding and template overrides for layout fixes."""
-
-    # Template overrides - these point to our custom templates directory
-    # The base_site.html template contains CSS fixes for the search bar positioning
-
     def each_context(self, request):
         context = super().each_context(request)
-        company = CompanyProfile.get_active()
+        company = CompanyProfile.get_active(request)
         if company:
             context['site_header'] = company.company_name
             context['site_title'] = f"{company.company_name} - Billing & Project Management"
@@ -56,8 +129,10 @@ admin_sites.site = admin.site
 # =============================================================================
 
 @admin.register(Client)
-class ClientAdmin(admin.ModelAdmin):
-    list_display = ["name", "contact_person", "vat_number", "statement_button", "outstanding_button", "progress_button"]
+class ClientAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'company'
+    list_display = ["name", "contact_person", "vat_number", "company", "statement_button", "outstanding_button", "progress_button"]
+    list_filter = ["company"]
 
     def statement_button(self, obj):
         url = reverse('admin:client_statement', args=[obj.pk])
@@ -144,16 +219,16 @@ class ClientAdmin(admin.ModelAdmin):
 </body></html>"""
 
     def statement_view(self, request, pk):
-        client = get_object_or_404(Client, pk=pk)
-        company = CompanyProfile.get_active()
+        client = self.get_object_or_404_scoped(request, Client, pk=pk)
+        company = CompanyProfile.get_active(request)
         logo_url = company.logo.url if company and company.logo else ''
 
         tax_invoices = Invoice.objects.filter(
-            project__client=client, inv_type='T'
+            project__client=client, project__company=company, inv_type='T'
         ).exclude(is_advance_invoice=True).select_related('project').order_by('project__project_id_code', 'date', 'inv_number')
 
         proforma_invoices = Invoice.objects.filter(
-            project__client=client, inv_type='P'
+            project__client=client, project__company=company, inv_type='P'
         ).exclude(is_advance_invoice=True).select_related('project').order_by('project__project_id_code', 'date', 'inv_number')
 
         from collections import OrderedDict
@@ -370,11 +445,11 @@ class ClientAdmin(admin.ModelAdmin):
         return HttpResponse(html)
 
     def outstanding_view(self, request, pk):
-        client = get_object_or_404(Client, pk=pk)
-        company = CompanyProfile.get_active()
+        company = self.get_active_company(request)
+        client = self.get_object_or_404_scoped(request, Client, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
         invoices = Invoice.objects.filter(
-            project__client=client
+            project__client=client, project__company=company
         ).exclude(status='Paid').select_related('project').order_by('date')
 
         draft_rows = ""
@@ -426,10 +501,10 @@ class ClientAdmin(admin.ModelAdmin):
         return HttpResponse(html)
 
     def progress_view(self, request, pk):
-        client = get_object_or_404(Client, pk=pk)
-        company = CompanyProfile.get_active()
+        company = self.get_active_company(request)
+        client = self.get_object_or_404_scoped(request, Client, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
-        projects = client.projects.all().prefetch_related('invoices', 'boq_items')
+        projects = client.projects.filter(company=company).prefetch_related('invoices', 'boq_items')
 
         cards = ""
         for proj in projects:
@@ -521,7 +596,8 @@ class ClientAdmin(admin.ModelAdmin):
 # =============================================================================
 
 @admin.register(BOQItem)
-class BOQItemAdmin(admin.ModelAdmin):
+class BOQItemAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'project__company'
     search_fields = ["item_number", "description"]
     list_display = ["item_number", "description", "project", "fmt_qty", "fmt_rate", "fmt_total"]
 
@@ -549,7 +625,7 @@ class BOQItemAdmin(admin.ModelAdmin):
         project_id = request.GET.get('project_id')
         if not project_id:
             return JsonResponse([], safe=False)
-        items = BOQItem.objects.filter(project_id=project_id).values('id', 'item_number', 'description')
+        items = BOQItem.objects.filter(project_id=project_id, project__company=self.get_active_company(request)).values('id', 'item_number', 'description')
         data = [{'id': item['id'], 'text': f"{item['item_number']} - {item['description'][:40]}"} for item in items]
         return JsonResponse(data, safe=False)
 
@@ -561,6 +637,13 @@ class BOQItemAdmin(admin.ModelAdmin):
 class BOQItemInline(admin.TabularInline):
     model = BOQItem
     extra = 1
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == 'project':
+            company = CompanyProfile.get_active(request)
+            if company:
+                kwargs['queryset'] = Project.objects.filter(company=company)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 class ExpenseInlineForm(forms.ModelForm):
@@ -600,21 +683,29 @@ class ExpenseInline(admin.TabularInline):
             formset.parent_project = obj
         return formset
 
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == 'boq_item':
+            if getattr(self, 'parent_project', None):
+                kwargs['queryset'] = BOQItem.objects.filter(project=self.parent_project)
+            else:
+                kwargs['queryset'] = BOQItem.objects.none()
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
 
 @admin.register(Project)
-class ProjectAdmin(admin.ModelAdmin):
+class ProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'company'
     inlines = [BOQItemInline, ExpenseInline]
     list_display = [
-        "project_id_code", "action_buttons", "project_name", "client", "fmt_po",
+        "project_id_code", "action_buttons", "project_name", "client", "company", "fmt_po",
         "fmt_boq_total", "is_boq_complete", "fmt_advance",
         "fmt_ret_a_pct", "fmt_ret_b_pct"
     ]
+    list_filter = ["company", "is_boq_complete"]
     readonly_fields = ["is_boq_complete"]
     search_fields = ["project_id_code", "project_name"]
 
-    # ---- FIXED: Single column with all 3 buttons inline ----
     def action_buttons(self, obj):
-        """Combine all action buttons into one compact cell to prevent column misalignment."""
         app_label = obj._meta.app_label
         invoices_url = reverse(f'admin:{app_label}_invoice_changelist') + f'?project__id__exact={obj.id}'
         analytics_url = reverse('admin:project_analytics', args=[obj.pk])
@@ -639,12 +730,12 @@ class ProjectAdmin(admin.ModelAdmin):
 
     def _logo_bar(self, logo_url):
         if logo_url:
-            return f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:60px; max-width:180px; object-fit:contain;"></div>'
+            return f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>'
         return ''
 
     def cost_profit_view(self, request, pk):
-        proj = get_object_or_404(Project, pk=pk)
-        company = CompanyProfile.get_active()
+        company = self.get_active_company(request)
+        proj = self.get_object_or_404_scoped(request, Project, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
 
         latest_inv = Invoice.objects.filter(
@@ -660,11 +751,10 @@ class ProjectAdmin(admin.ModelAdmin):
         grand_expenses = Decimal("0")
         grand_profit = Decimal("0")
 
-        # 1. CALCULATE TOTAL MANPOWER COST FOR THE PROJECT
         total_manpower = Decimal("0")
 
         for cc in PayrollCostCenter.objects.filter(
-                project=proj
+                project=proj, payroll_record__employee__company=company
         ).select_related('payroll_record__employee'):
             emp = cc.payroll_record.employee
             days = cc.days_count
@@ -684,7 +774,7 @@ class ProjectAdmin(admin.ModelAdmin):
 
             total_manpower += payroll_portion + admin_portion
 
-        for emp in Employee.objects.filter(project=proj, is_active=True):
+        for emp in Employee.objects.filter(project=proj, is_active=True, company=company):
             for pr in PayrollRecord.objects.filter(employee=emp):
                 if not pr.cost_centers.filter(project=proj).exists():
                     days_in_month = calendar.monthrange(pr.month.year, pr.month.month)[1]
@@ -703,7 +793,6 @@ class ProjectAdmin(admin.ModelAdmin):
                         )
                         total_manpower += payroll_portion + admin_portion
 
-        # 2. ALLOCATE TOTAL MANPOWER TO BOQ ITEMS BY PROGRESS PERCENTAGE
         boq_manpower = {}
         total_work = latest_inv.cumulative_work_done if latest_inv else Decimal("0")
         total_boq_value = sum(b.quantity * b.rate for b in boq_items)
@@ -724,7 +813,6 @@ class ProjectAdmin(admin.ModelAdmin):
 
             boq_manpower[boq.id] = money(total_manpower * pct)
 
-        # 3. BUILD REPORT ROWS
         for boq in boq_items:
             inv_items = InvoiceItem.objects.filter(
                 boq_item=boq,
@@ -789,7 +877,7 @@ class ProjectAdmin(admin.ModelAdmin):
         * {{ box-sizing: border-box; margin:0; padding:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
         body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 9px; color: #222; padding: 10px; }}
         .logo-bar {{ text-align: right; margin-bottom: 6px; }}
-        .logo-bar img {{ max-height: 60px; max-width: 180px; object-fit: contain; }}
+        .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
         .report-title {{ font-size: 20px; font-weight: bold; text-align: center; color: #000080; margin-bottom: 4px; }}
         .report-subtitle {{ font-size: 12px; text-align: center; color: #666; margin-bottom: 12px; }}
         .meta-box {{ background: #f5f5f5; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; line-height: 1.5; font-size: 10px; display: flex; justify-content: space-between; }}
@@ -890,10 +978,10 @@ class ProjectAdmin(admin.ModelAdmin):
         return HttpResponse(html)
 
     def analytics_view(self, request, pk):
-        proj = get_object_or_404(Project, pk=pk)
+        company = self.get_active_company(request)
+        proj = self.get_object_or_404_scoped(request, Project, pk=pk)
         invoices = Invoice.objects.filter(project=proj).order_by('inv_number')
         boq_items = BOQItem.objects.filter(project=proj).order_by('item_number')
-        company = CompanyProfile.get_active()
         logo_url = company.logo.url if company and company.logo else ''
 
         certified_invoices = invoices.filter(
@@ -1017,7 +1105,7 @@ class ProjectAdmin(admin.ModelAdmin):
     * {{ box-sizing: border-box; margin:0; padding:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
     body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 10px; color: #222; padding: 10px; }}
     .logo-bar {{ text-align: right; margin-bottom: 6px; }}
-    .logo-bar img {{ max-height: 60px; max-width: 180px; object-fit: contain; }}
+    .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
     .report-title {{ font-size: 18px; font-weight: bold; text-align: center; color: #000080; margin-bottom: 4px; }}
     .report-subtitle {{ font-size: 12px; text-align: center; color: #666; margin-bottom: 15px; }}
     .meta-box {{ background: #f5f5f5; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; line-height: 1.6; font-size: 10px; }}
@@ -1230,9 +1318,18 @@ class InvoiceItemInline(admin.TabularInline):
         return mark_safe(f'<div style="text-align:right;color:#ed6c02;">{obj.retention_b_amount:,.2f}</div>')
     fmt_ret_b.short_description = "Ret B"
 
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == 'boq_item':
+            if hasattr(request, '_invoice_project_id'):
+                kwargs['queryset'] = BOQItem.objects.filter(project_id=request._invoice_project_id)
+            else:
+                kwargs['queryset'] = BOQItem.objects.none()
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
 
 @admin.register(Invoice)
-class InvoiceAdmin(admin.ModelAdmin):
+class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'project__company'
     inlines = [InvoiceItemInline]
     list_display = [
         "fmt_inv_str", "project", "inv_type", "status", "retention_recovery",
@@ -1263,6 +1360,12 @@ class InvoiceAdmin(admin.ModelAdmin):
             )
         }),
     )
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if obj and obj.project:
+            request._invoice_project_id = obj.project_id
+        return form
 
     def ui_cumulative_work(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.cumulative_work_done:,.2f}</div>')
@@ -1339,8 +1442,8 @@ class InvoiceAdmin(admin.ModelAdmin):
         return [path('<int:pk>/print/', self.admin_site.admin_view(self.print_view), name='invoice_print')] + urls
 
     def print_view(self, request, pk):
-        inv = get_object_or_404(Invoice, pk=pk)
-        company = CompanyProfile.get_active()
+        company = self.get_active_company(request)
+        inv = self.get_object_or_404_scoped(request, Invoice, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
         header_title = "PROFORMA INVOICE" if inv.inv_type == "P" else "TAX INVOICE"
 
@@ -1438,7 +1541,7 @@ class InvoiceAdmin(admin.ModelAdmin):
             </tr>
         """
 
-        logo_bar_html = f'<div style="text-align:right; margin-bottom:8px;"><img src="{logo_url}" alt="Logo" style="max-height:60px; max-width:180px; object-fit:contain;"></div>' if logo_url else ''
+        logo_bar_html = f'<div style="text-align:right; margin-bottom:8px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>' if logo_url else ''
 
         html = f"""<!DOCTYPE html>
     <html>
@@ -1606,9 +1709,10 @@ class ExpenseCategoryAdmin(admin.ModelAdmin):
 
 
 @admin.register(Expense)
-class ExpenseAdmin(admin.ModelAdmin):
+class ExpenseAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'project__company'
     list_display = ["date", "project", "category", "sub_category", "fmt_amount", "boq_item", "is_allocated"]
-    list_filter = ["project", "category", "date", "is_allocated"]
+    list_filter = ["project__company", "project", "category", "date", "is_allocated"]
     search_fields = ["description", "reference_number"]
     autocomplete_fields = ["project"]
 
@@ -1632,6 +1736,7 @@ class ExpenseAdmin(admin.ModelAdmin):
         return form
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        company = self.get_active_company(request)
         if db_field.name == "boq_item":
             if request.resolver_match and request.resolver_match.kwargs.get('object_id'):
                 obj = self.get_object(request, request.resolver_match.kwargs['object_id'])
@@ -1650,6 +1755,8 @@ class ExpenseAdmin(admin.ModelAdmin):
                     kwargs["queryset"] = SubExpense.objects.none()
             else:
                 kwargs["queryset"] = SubExpense.objects.none()
+        else:
+            return super().formfield_for_foreignkey(db_field, request, **kwargs)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
@@ -1662,6 +1769,13 @@ class EmployeeTransferInline(admin.TabularInline):
     extra = 0
     fields = ["to_project", "from_date", "to_date", "days_count", "notes"]
     readonly_fields = ["days_count"]
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == 'to_project':
+            company = CompanyProfile.get_active(request)
+            if company:
+                kwargs['queryset'] = Project.objects.filter(company=company)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
 class EmployeeAdminForm(forms.ModelForm):
@@ -1696,14 +1810,15 @@ class EmployeeAdminForm(forms.ModelForm):
 
 
 @admin.register(Employee)
-class EmployeeAdmin(admin.ModelAdmin):
+class EmployeeAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'company'
     form = EmployeeAdminForm
     list_display = [
         "employee_id", "name", "employee_type", "payment_type",
-        "cost_center", "fmt_total_salary", "fmt_total_package", "fmt_eos",
+        "cost_center", "company", "fmt_total_salary", "fmt_total_package", "fmt_eos",
         "fmt_daily_cost", "fmt_hourly_rate", "fmt_bank_info", "is_active", "transfer_status"
     ]
-    list_filter = ["employee_type", "payment_type", "is_head_office", "is_active", "project"]
+    list_filter = ["company", "employee_type", "payment_type", "is_head_office", "is_active", "project"]
     search_fields = ["name", "employee_id"]
     inlines = [EmployeeTransferInline]
     readonly_fields = ["total_salary", "monthly_admin_cost", "daily_cost", "hourly_rate_ot", "display_eos"]
@@ -1712,7 +1827,7 @@ class EmployeeAdmin(admin.ModelAdmin):
             "fields": (
                 ("employee_id", "name"),
                 ("employee_type", "payment_type"),
-                ("project", "is_head_office"),
+                ("company", "project", "is_head_office"),
                 ("is_active", "date_joined"),
             )
         }),
@@ -1749,6 +1864,13 @@ class EmployeeAdmin(admin.ModelAdmin):
             "description": "Bank information for Bank Transfer or WPS Agency payments."
         }),
     )
+
+    def save_model(self, request, obj, form, change):
+        if obj.project and not obj.company_id:
+            obj.company = obj.project.company
+        elif not obj.company_id:
+            obj.company = CompanyProfile.get_active(request)
+        super().save_model(request, obj, form, change)
 
     def display_eos(self, obj):
         import logging
@@ -1831,7 +1953,8 @@ class EmployeeAdmin(admin.ModelAdmin):
 
     def changelist_view(self, request, extra_context=None):
         from django.db.models import Q
-        complete_projects = Project.objects.filter(is_boq_complete=True)
+        company = self.get_active_company(request)
+        complete_projects = Project.objects.filter(is_boq_complete=True, company=company)
         for proj in complete_projects:
             workers = Employee.objects.filter(project=proj, is_active=True)
             if workers.exists():
@@ -1860,6 +1983,15 @@ class PayrollAllocationInline(admin.TabularInline):
     ]
     can_delete = False
 
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        company = CompanyProfile.get_active(request)
+        if company:
+            if db_field.name == 'project':
+                kwargs['queryset'] = Project.objects.filter(company=company)
+            elif db_field.name == 'boq_item':
+                kwargs['queryset'] = BOQItem.objects.filter(project__company=company)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
 
 class PayrollCostCenterInline(admin.TabularInline):
     model = PayrollCostCenter
@@ -1873,6 +2005,12 @@ class PayrollCostCenterInline(admin.TabularInline):
         if 'overtime_hours' in formset.form.base_fields:
             formset.form.base_fields['overtime_hours'].widget = forms.NumberInput(attrs={'step': '1', 'min': '0'})
         return formset
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        company = CompanyProfile.get_active(request)
+        if company and db_field.name == 'project':
+            kwargs['queryset'] = Project.objects.filter(company=company)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
     def fmt_overtime_amount(self, obj):
         try:
@@ -1896,7 +2034,8 @@ class PayrollRecordAdminForm(forms.ModelForm):
 
 
 @admin.register(PayrollRecord)
-class PayrollRecordAdmin(admin.ModelAdmin):
+class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'employee__company'
     form = PayrollRecordAdminForm
     inlines = [PayrollCostCenterInline, PayrollAllocationInline]
     list_display = [
@@ -1995,7 +2134,8 @@ class PayrollRecordAdmin(admin.ModelAdmin):
         today = date.today()
         first_day = today.replace(day=1)
         last_month = (first_day - timedelta(days=1)).replace(day=1)
-        unallocated = PayrollRecord.objects.filter(month=last_month, is_allocated=False).count()
+        company = self.get_active_company(request)
+        unallocated = PayrollRecord.objects.filter(month=last_month, is_allocated=False, employee__company=company).count()
         if unallocated > 0:
             messages.warning(
                 request,
@@ -2027,9 +2167,9 @@ class PayrollRecordAdmin(admin.ModelAdmin):
         return custom + urls
 
     def timesheet_view(self, request, pk):
-        payroll = get_object_or_404(PayrollRecord, pk=pk)
+        company = self.get_active_company(request)
+        payroll = self.get_object_or_404_scoped(request, PayrollRecord, pk=pk)
         emp = payroll.employee
-        company = CompanyProfile.get_active()
         logo_url = company.logo.url if company and company.logo else ''
 
         month_start = payroll.month
@@ -2150,7 +2290,7 @@ class PayrollRecordAdmin(admin.ModelAdmin):
     * {{ box-sizing: border-box; margin:0; padding:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
     body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 10px; color: #222; padding: 10px; }}
     .logo-bar {{ text-align: right; margin-bottom: 6px; }}
-    .logo-bar img {{ max-height: 60px; max-width: 180px; object-fit: contain; }}
+    .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
     .report-title {{ font-size: 18px; font-weight: bold; text-align: center; color: #000080; margin-bottom: 4px; }}
     .report-subtitle {{ font-size: 12px; text-align: center; color: #666; margin-bottom: 15px; }}
     .meta-box {{ background: #f5f5f5; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; line-height: 1.6; font-size: 10px; }}
@@ -2269,6 +2409,7 @@ class PayrollRecordAdmin(admin.ModelAdmin):
 
     def labor_cost_report(self, request):
         from datetime import datetime
+        company = self.get_active_company(request)
         month_str = request.GET.get("month")
         if month_str:
             try:
@@ -2281,11 +2422,10 @@ class PayrollRecordAdmin(admin.ModelAdmin):
         last_day = calendar.monthrange(month.year, month.month)[1]
         month_end = month.replace(day=last_day)
 
-        company = CompanyProfile.get_active()
         logo_url = company.logo.url if company and company.logo else ''
 
         records = PayrollRecord.objects.filter(
-            month=month
+            month=month, employee__company=company
         ).select_related('employee').prefetch_related('cost_centers', 'cost_centers__project')
 
         projects = {}
@@ -2444,7 +2584,7 @@ class PayrollRecordAdmin(admin.ModelAdmin):
     * {{ box-sizing: border-box; margin:0; padding:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
     body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 9px; color: #222; padding: 10px; }}
     .logo-bar {{ text-align: right; margin-bottom: 6px; }}
-    .logo-bar img {{ max-height: 50px; max-width: 160px; object-fit: contain; }}
+    .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
     .report-title {{ font-size: 20px; font-weight: bold; text-align: center; color: #000080; margin-bottom: 4px; }}
     .report-subtitle {{ font-size: 12px; text-align: center; color: #666; margin-bottom: 12px; }}
     .meta-box {{ background: #f5f5f5; padding: 10px 15px; border-radius: 6px; margin-bottom: 15px; line-height: 1.5; font-size: 10px; display:flex; justify-content:space-between; align-items:center; }}
@@ -2496,13 +2636,13 @@ class PayrollRecordAdmin(admin.ModelAdmin):
 
     def _logo_bar(self, logo_url):
         if logo_url:
-            return f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:60px; max-width:180px; object-fit:contain;"></div>'
+            return f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>'
         return ''
 
     def _payroll_report_wrapper(self, title, headers, rows, totals, payment_method):
-        company = CompanyProfile.get_active()
+        company = CompanyProfile.get_active(request)
         logo_url = company.logo.url if company and company.logo else ''
-        logo_bar_html = f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:60px; max-width:180px; object-fit:contain;"></div>' if logo_url else ''
+        logo_bar_html = f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>' if logo_url else ''
 
         header_cells = "".join(f"<th>{h}</th>" for h in headers)
         total_row = ""
@@ -2569,10 +2709,12 @@ class PayrollRecordAdmin(admin.ModelAdmin):
 </body></html>"""
 
     def staff_report(self, request):
+        company = self.get_active_company(request)
         month = request.GET.get("month")
         qs = PayrollRecord.objects.filter(
             employee__employee_type="Staff",
-            employee__payment_type="Bank"
+            employee__payment_type="Bank",
+            employee__company=company
         ).select_related("employee").order_by("-month")
         if month:
             qs = qs.filter(month=month)
@@ -2614,10 +2756,12 @@ class PayrollRecordAdmin(admin.ModelAdmin):
         return HttpResponse(html)
 
     def wps_report(self, request):
+        company = self.get_active_company(request)
         month = request.GET.get("month")
         qs = PayrollRecord.objects.filter(
             employee__employee_type="Site",
-            employee__payment_type="WPS"
+            employee__payment_type="WPS",
+            employee__company=company
         ).select_related("employee").order_by("-month")
         if month:
             qs = qs.filter(month=month)
@@ -2653,9 +2797,11 @@ class PayrollRecordAdmin(admin.ModelAdmin):
         return HttpResponse(html)
 
     def cash_report(self, request):
+        company = self.get_active_company(request)
         month = request.GET.get("month")
         qs = PayrollRecord.objects.filter(
-            employee__payment_type="Cash"
+            employee__payment_type="Cash",
+            employee__company=company
         ).select_related("employee").order_by("-month")
         if month:
             qs = qs.filter(month=month)
@@ -2683,8 +2829,9 @@ class PayrollRecordAdmin(admin.ModelAdmin):
         today = date.today()
         first_day = today.replace(day=1)
         last_month = (first_day - timedelta(days=1)).replace(day=1)
+        company = self.get_active_company(request)
         unallocated = PayrollRecord.objects.filter(
-            month=last_month, is_allocated=False
+            month=last_month, is_allocated=False, employee__company=company
         ).select_related("employee")
 
         if request.method == "POST":
@@ -2773,11 +2920,19 @@ class PricingBOQItemInline(admin.TabularInline):
     ]
     readonly_fields = ["historical_rate", "historical_cost", "proposed_total"]
 
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        company = CompanyProfile.get_active(request)
+        if company and db_field.name == 'reference_boq_item':
+            kwargs['queryset'] = BOQItem.objects.filter(project__company=company)
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
 
 @admin.register(PricingProject)
-class PricingProjectAdmin(admin.ModelAdmin):
+class PricingProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'company'
     inlines = [PricingBOQItemInline]
-    list_display = ["project_name", "client", "created_date", "fmt_total"]
+    list_display = ["project_name", "client", "company", "created_date", "fmt_total"]
+    list_filter = ["company"]
     search_fields = ["project_name", "client__name"]
     filter_horizontal = ["reference_projects"]
 

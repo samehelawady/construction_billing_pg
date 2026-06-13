@@ -1,4 +1,13 @@
-{% extends "admin/base_site.html" %}
+{% extends "admin/base.html" %}
+
+{% block branding %}
+    {{ block.super }}
+    {% if company_switcher %}
+        <div style="display:inline-block;">
+            {{ company_switcher }}
+        </div>
+    {% endif %}
+{% endblock %}
 
 {% block extrastyle %}
 {{ block.super }}

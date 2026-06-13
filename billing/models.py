@@ -20,6 +20,10 @@ from .utils import money
 # =============================================================================
 
 class Client(models.Model):
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='clients', null=True, blank=True
+    )
     name = models.CharField(max_length=255)
     address = models.TextField(blank=True, null=True)
     contact_person = models.CharField(max_length=255, blank=True, null=True)
@@ -66,10 +70,30 @@ class CompanyProfile(models.Model):
         return self.company_name
 
     @classmethod
-    def get_active(cls):
-        """Return the currently active company profile."""
-        active = cls.objects.filter(is_active=True).first()
-        return active if active else cls.objects.first()
+    def get_active(cls, request):
+        """Get active company from request session — safe per-request."""
+        company_id = request.session.get('active_company_id')
+        if company_id:
+            try:
+                return cls.objects.get(pk=company_id, is_active=True)
+            except cls.DoesNotExist:
+                pass
+        return None
+
+    def set_active(self, request):
+        request.session['active_company_id'] = self.pk
+        request.session.modified = True
+
+    @classmethod
+    def get_active(cls, request):
+        company_id = request.session.get('active_company_id')
+        if company_id:
+            try:
+                return cls.objects.get(pk=company_id, is_active=True)
+            except cls.DoesNotExist:
+                pass
+        # Fallback: first active company
+        return cls.objects.filter(is_active=True).first()
 
     def save(self, *args, **kwargs):
         if self.is_active:
@@ -78,6 +102,13 @@ class CompanyProfile(models.Model):
 
 
 class Project(models.Model):
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='projects', null=True, blank=True
+    )
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name='projects'
+    )
     client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name="projects")
     project_id_code = models.CharField(max_length=50, unique=True)
     project_name = models.CharField(max_length=255)
@@ -556,6 +587,13 @@ class SubExpense(models.Model):
 
 
 class Expense(models.Model):
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='expenses', null=True, blank=True
+    )
+    project = models.ForeignKey(
+        Project, on_delete=models.CASCADE, related_name='expenses'
+    )
     project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="expenses")
     boq_item = models.ForeignKey(BOQItem, on_delete=models.SET_NULL, null=True, blank=True, related_name="expenses")
     category = models.ForeignKey(ExpenseCategory, on_delete=models.PROTECT, related_name="expenses")
@@ -581,6 +619,14 @@ class Expense(models.Model):
 # =============================================================================
 
 class Employee(models.Model):
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='employees', null=True, blank=True
+    )
+    project = models.ForeignKey(
+        Project, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='employees'
+    )
     EMPLOYEE_TYPE_CHOICES = [
         ('Staff', 'Office Staff'),
         ('Site', 'Site Worker'),
@@ -1013,6 +1059,13 @@ class PayrollAllocation(models.Model):
 # =============================================================================
 
 class PricingProject(models.Model):
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='pricing_projects', null=True, blank=True
+    )
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name='pricing_projects'
+    )
     project_name = models.CharField(max_length=255)
     client = models.ForeignKey(Client, on_delete=models.CASCADE, related_name="pricing_projects")
     description = models.TextField(blank=True, null=True)
