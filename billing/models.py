@@ -559,13 +559,18 @@ class InvoiceItem(models.Model):
 # =============================================================================
 
 class ExpenseCategory(models.Model):
-    name = models.CharField(max_length=255, unique=True)
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='expense_categories', null=True, blank=True
+    )
+    name = models.CharField(max_length=255)  # Remove unique=True — should be unique per company, not globally
     description = models.TextField(blank=True, null=True)
 
     class Meta:
         verbose_name = "Expense Category"
         verbose_name_plural = "Expense Categories"
         ordering = ['name']
+        unique_together = ('company', 'name')  # Unique per company, not globally
 
     def __str__(self):
         return self.name

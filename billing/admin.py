@@ -21,6 +21,7 @@ from django.contrib import messages
 from django.shortcuts import redirect
 from django import forms
 from .utils import money
+from django.shortcuts import redirect
 
 
 # =============================================================================
@@ -36,13 +37,11 @@ class CompanyScopedAdminMixin:
     def get_queryset(self, request):
         qs = super().get_queryset(request)
         company = self.get_active_company(request)
-
-        # During transition: if no active company, show all data
         if not company:
-            return qs
+            return qs  # Or return qs.none() if you want strict mode
 
-        if self.company_field_path and not getattr(request.user, 'is_superuser', False):
-            # Include records with matching company OR null company
+        if self.company_field_path:
+            # Filter applies to ALL users, including superusers
             null_filter = {self.company_field_path + '__isnull': True}
             qs = qs.filter(
                 Q(**{self.company_field_path: company}) | Q(**null_filter)
@@ -91,7 +90,40 @@ class CompanyScopedAdminMixin:
                 kwargs['queryset'] = Project.objects.filter(
                     Q(company=company) | Q(company__isnull=True)
                 )
+            elif db_field.name == 'boq_item':
+                kwargs['queryset'] = BOQItem.objects.filter(
+                    Q(project__company=company) | Q(project__company__isnull=True)
+                )
+            elif db_field.name == 'category':
+                kwargs['queryset'] = ExpenseCategory.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+            elif db_field.name == 'sub_category':
+                kwargs['queryset'] = SubExpense.objects.filter(
+                    Q(parent__company=company) | Q(parent__company__isnull=True)
+                )
+            elif db_field.name == 'payroll_record':
+                kwargs['queryset'] = PayrollRecord.objects.filter(
+                    Q(employee__company=company) | Q(employee__company__isnull=True)
+                )
+            elif db_field.name == 'to_project':
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+            elif db_field.name == 'invoice':
+                kwargs['queryset'] = Invoice.objects.filter(
+                    Q(project__company=company) | Q(project__company__isnull=True)
+                )
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def formfield_for_manytomany(self, db_field, request, **kwargs):
+        company = self.get_active_company(request)
+        if company:
+            if db_field.name == 'reference_projects':
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+        return super().formfield_for_manytomany(db_field, request, **kwargs)
 
     def save_model(self, request, obj, form, change):
         company = self.get_active_company(request)
@@ -101,14 +133,17 @@ class CompanyScopedAdminMixin:
             else:
                 obj.company = company
         super().save_model(request, obj, form, change)
+
+
 # =============================================================================
-# DYNAMIC ADMIN SITE
+# DYNAMIC ADMIN SITE WITH COMPANY CONTEXT
 # =============================================================================
 
 class DynamicAdminSite(AdminSite):
     def each_context(self, request):
         context = super().each_context(request)
         company = CompanyProfile.get_active(request)
+
         if company:
             context['site_header'] = company.company_name
             context['site_title'] = f"{company.company_name} - Billing & Project Management"
@@ -117,7 +152,21 @@ class DynamicAdminSite(AdminSite):
             context['site_header'] = "Billing & Project Management"
             context['site_title'] = "Billing & Project Management"
             context['index_title'] = "Billing & Project Management Portal"
+
+        # ADD THIS: company switcher dropdown data
+        if request.user.is_authenticated:
+            context['available_companies'] = CompanyProfile.objects.filter(is_active=True)
+            context['active_company'] = company
+
         return context
+
+    def index(self, request, extra_context=None):
+        """Override index to add company-aware context."""
+        company = CompanyProfile.get_active(request)
+        if extra_context is None:
+            extra_context = {}
+        extra_context['active_company'] = company
+        return super().index(request, extra_context)
 
 
 admin.site = DynamicAdminSite(name="admin")
@@ -170,65 +219,70 @@ class ClientAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         return ''
 
     def _report_wrapper(self, body_html, logo_url=''):
-        return f"""<!DOCTYPE html>
-<html><head><meta charset="UTF-8">
-<style>
-    @page {{ size: A4 portrait; margin: 10mm; }}
-    * {{ box-sizing: border-box; margin:0; padding:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
-    body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 10px; color: #222; padding: 10px; }}
-    .logo-bar {{ text-align: right; margin-bottom: 6px; }}
-    .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
-    .report-title {{ font-size: 18px; font-weight: bold; text-align: center; color: #000080; margin-bottom: 4px; }}
-    .report-subtitle {{ font-size: 12px; text-align: center; color: #666; margin-bottom: 15px; }}
-    .meta-box {{ background: #f5f5f5; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; line-height: 1.6; font-size: 10px; }}
-    .section-header {{ font-size: 12px; font-weight: bold; color: #000080; margin: 15px 0 8px 0; border-bottom: 2px solid #000080; padding-bottom: 4px; }}
-    .report-table {{ width: 100%; border-collapse: collapse; font-size: 9px; margin-top: 6px; }}
-    .report-table th {{ background: #e8e8e8; border: 1px solid #999; padding: 5px; text-align: left; font-weight: bold; }}
-    .report-table td {{ border: 1px solid #ccc; padding: 5px; }}
-    .report-table .num {{ text-align: right; white-space: nowrap; }}
-    .report-table tr:nth-child(even) {{ background: #fafafa; }}
-    .total-row td {{ background: #e3f2fd; font-weight: bold; border-top: 2px solid #333; }}
-    .grand-total-box {{ margin-top: 20px; padding: 12px; background: #000080; color: white; text-align: center; font-size: 14px; border-radius: 6px; }}
-    .cards-container {{ display: flex; flex-direction: column; gap: 15px; }}
-    .project-card {{ border: 1px solid #ccc; border-radius: 8px; overflow: hidden; page-break-inside: avoid; }}
-    .card-header {{ background: #000080; color: white; padding: 8px 12px; font-size: 11px; font-weight: bold; }}
-    .card-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 12px; background: #fafafa; }}
-    .metric {{ text-align: center; }}
-    .metric-label {{ font-size: 8px; color: #666; text-transform: uppercase; margin-bottom: 3px; }}
-    .metric-value {{ font-size: 13px; font-weight: bold; }}
-    .bar-section {{ padding: 0 12px 12px 12px; background: #fafafa; }}
-    .bar-label {{ font-size: 9px; margin-bottom: 4px; font-weight: bold; }}
-    .bar-track {{ width: 100%; height: 18px; background: #e0e0e0; border-radius: 9px; overflow: hidden; }}
-    .bar-fill {{ height: 100%; background: linear-gradient(90deg, #447e9b, #2e7d32); border-radius: 9px; transition: width 0.5s; }}
-    .retention-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 12px; background: white; }}
-    .ret-block {{ border: 1px solid #e0e0e0; border-radius: 6px; padding: 8px; }}
-    .ret-title {{ font-size: 9px; font-weight: bold; color: #000080; margin-bottom: 6px; text-align: center; border-bottom: 1px solid #eee; padding-bottom: 4px; }}
-    .ret-row {{ display: flex; justify-content: space-between; font-size: 9px; margin-bottom: 3px; }}
-    .project-section {{ margin-bottom: 25px; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; page-break-inside: avoid; }}
-    .project-header {{ background: #000080; color: white; padding: 8px 12px; font-size: 11px; font-weight: bold; }}
-    .project-meta {{ background: #f0f0f0; padding: 6px 12px; font-size: 9px; border-bottom: 1px solid #ddd; }}
-    .project-total-row td {{ background: #fff8e1; font-weight: bold; border-top: 2px solid #666; font-size: 9px; }}
-    .grand-total-box {{ margin-top: 20px; padding: 15px; background: #000080; color: white; border-radius: 8px; }}
-    .grand-table {{ width: 100%; color: white; font-size: 11px; }}
-    .grand-table td {{ padding: 4px 8px; }}
-    .grand-table .num {{ text-align: right; font-weight: bold; }}
-    .proforma-badge {{ display: inline-block; background: #ed6c02; color: white; padding: 2px 6px; border-radius: 3px; font-size: 8px; font-weight: bold; }}
-</style></head><body>
-    {self._logo_bar(logo_url)}
-    {body_html}
-</body></html>"""
+            return f"""<!DOCTYPE html>
+    <html><head><meta charset="UTF-8">
+    <style>
+        @page {{ size: A4 portrait; margin: 10mm; }}
+        * {{ box-sizing: border-box; margin:0; padding:0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+        body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 10px; color: #222; padding: 10px; }}
+        .logo-bar {{ text-align: right; margin-bottom: 6px; }}
+        .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
+        .report-title {{ font-size: 18px; font-weight: bold; text-align: center; color: #000080; margin-bottom: 4px; }}
+        .report-subtitle {{ font-size: 12px; text-align: center; color: #666; margin-bottom: 15px; }}
+        .meta-box {{ background: #f5f5f5; padding: 10px 15px; border-radius: 6px; margin-bottom: 20px; line-height: 1.6; font-size: 10px; }}
+        .section-header {{ font-size: 12px; font-weight: bold; color: #000080; margin: 15px 0 8px 0; border-bottom: 2px solid #000080; padding-bottom: 4px; }}
+        .report-table {{ width: 100%; border-collapse: collapse; font-size: 9px; margin-top: 6px; }}
+        .report-table th {{ background: #e8e8e8; border: 1px solid #999; padding: 5px; text-align: left; font-weight: bold; }}
+        .report-table td {{ border: 1px solid #ccc; padding: 5px; }}
+        .report-table .num {{ text-align: right; white-space: nowrap; }}
+        .report-table tr:nth-child(even) {{ background: #fafafa; }}
+        .total-row td {{ background: #e3f2fd; font-weight: bold; border-top: 2px solid #333; }}
+        .grand-total-box {{ margin-top: 20px; padding: 12px; background: #000080; color: white; text-align: center; font-size: 14px; border-radius: 6px; }}
+        .cards-container {{ display: flex; flex-direction: column; gap: 15px; }}
+        .project-card {{ border: 1px solid #ccc; border-radius: 8px; overflow: hidden; page-break-inside: avoid; }}
+        .card-header {{ background: #000080; color: white; padding: 8px 12px; font-size: 11px; font-weight: bold; }}
+        .card-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; padding: 12px; background: #fafafa; }}
+        .metric {{ text-align: center; }}
+        .metric-label {{ font-size: 8px; color: #666; text-transform: uppercase; margin-bottom: 3px; }}
+        .metric-value {{ font-size: 13px; font-weight: bold; }}
+        .bar-section {{ padding: 0 12px 12px 12px; background: #fafafa; }}
+        .bar-label {{ font-size: 9px; margin-bottom: 4px; font-weight: bold; }}
+        .bar-track {{ width: 100%; height: 18px; background: #e0e0e0; border-radius: 9px; overflow: hidden; }}
+        .bar-fill {{ height: 100%; background: linear-gradient(90deg, #447e9b, #2e7d32); border-radius: 9px; transition: width 0.5s; }}
+        .retention-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 12px; background: white; }}
+        .ret-block {{ border: 1px solid #e0e0e0; border-radius: 6px; padding: 8px; }}
+        .ret-title {{ font-size: 9px; font-weight: bold; color: #000080; margin-bottom: 6px; text-align: center; border-bottom: 1px solid #eee; padding-bottom: 4px; }}
+        .ret-row {{ display: flex; justify-content: space-between; font-size: 9px; margin-bottom: 3px; }}
+        .project-section {{ margin-bottom: 25px; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; page-break-inside: avoid; }}
+        .project-header {{ background: #000080; color: white; padding: 8px 12px; font-size: 11px; font-weight: bold; }}
+        .project-meta {{ background: #f0f0f0; padding: 6px 12px; font-size: 9px; border-bottom: 1px solid #ddd; }}
+        .project-total-row td {{ background: #fff8e1; font-weight: bold; border-top: 2px solid #666; font-size: 9px; }}
+        .grand-total-box {{ margin-top: 20px; padding: 15px; background: #000080; color: white; border-radius: 8px; }}
+        .grand-table {{ width: 100%; color: white; font-size: 11px; }}
+        .grand-table td {{ padding: 4px 8px; }}
+        .grand-table .num {{ text-align: right; font-weight: bold; }}
+        .proforma-badge {{ display: inline-block; background: #ed6c02; color: white; padding: 2px 6px; border-radius: 3px; font-size: 8px; font-weight: bold; }}
+    </style></head><body>
+        {self._logo_bar(logo_url)}
+        {body_html}
+    </body></html>"""
 
     def statement_view(self, request, pk):
+        company = self.get_active_company(request)
         client = self.get_object_or_404_scoped(request, Client, pk=pk)
-        company = CompanyProfile.get_active(request)
         logo_url = company.logo.url if company and company.logo else ''
 
+        # FIX: Properly filter by company - handle null company during transition
+        base_invoice_filter = {'project__client': client}
+        if company:
+            base_invoice_filter['project__company'] = company
+
         tax_invoices = Invoice.objects.filter(
-            project__client=client, project__company=company, inv_type='T'
+            **base_invoice_filter, inv_type='T'
         ).exclude(is_advance_invoice=True).select_related('project').order_by('project__project_id_code', 'date', 'inv_number')
 
         proforma_invoices = Invoice.objects.filter(
-            project__client=client, project__company=company, inv_type='P'
+            **base_invoice_filter, inv_type='P'
         ).exclude(is_advance_invoice=True).select_related('project').order_by('project__project_id_code', 'date', 'inv_number')
 
         from collections import OrderedDict
@@ -448,8 +502,14 @@ class ClientAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         company = self.get_active_company(request)
         client = self.get_object_or_404_scoped(request, Client, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
+
+        # FIX: Properly filter by company
+        base_filter = {'project__client': client}
+        if company:
+            base_filter['project__company'] = company
+
         invoices = Invoice.objects.filter(
-            project__client=client, project__company=company
+            **base_filter
         ).exclude(status='Paid').select_related('project').order_by('date')
 
         draft_rows = ""
@@ -504,12 +564,22 @@ class ClientAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         company = self.get_active_company(request)
         client = self.get_object_or_404_scoped(request, Client, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
-        projects = client.projects.filter(company=company).prefetch_related('invoices', 'boq_items')
+
+        # FIX: Properly filter projects by company
+        projects_filter = {'client': client}
+        if company:
+            projects_filter['company'] = company
+        projects = Project.objects.filter(**projects_filter).prefetch_related('invoices', 'boq_items')
 
         cards = ""
         for proj in projects:
+            # FIX: Filter invoices by company as well
+            inv_filter = {'project': proj, 'is_advance_invoice': False}
+            if company:
+                inv_filter['project__company'] = company
+
             latest_inv = Invoice.objects.filter(
-                project=proj, is_advance_invoice=False
+                **inv_filter
             ).filter(
                 Q(inv_type='T') | Q(inv_type='P', status='Approved')
             ).order_by('-inv_number').first()
@@ -589,8 +659,6 @@ class ClientAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         """, logo_url)
         return HttpResponse(html)
 
-
-
 # =============================================================================
 # BOQ ITEM ADMIN
 # =============================================================================
@@ -625,7 +693,14 @@ class BOQItemAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         project_id = request.GET.get('project_id')
         if not project_id:
             return JsonResponse([], safe=False)
-        items = BOQItem.objects.filter(project_id=project_id, project__company=self.get_active_company(request)).values('id', 'item_number', 'description')
+
+        # FIX: Apply company scoping
+        company = self.get_active_company(request)
+        qs = BOQItem.objects.filter(project_id=project_id)
+        if company:
+            qs = qs.filter(Q(project__company=company) | Q(project__company__isnull=True))
+
+        items = qs.values('id', 'item_number', 'description')
         data = [{'id': item['id'], 'text': f"{item['item_number']} - {item['description'][:40]}"} for item in items]
         return JsonResponse(data, safe=False)
 
@@ -689,6 +764,15 @@ class ExpenseInline(admin.TabularInline):
                 kwargs['queryset'] = BOQItem.objects.filter(project=self.parent_project)
             else:
                 kwargs['queryset'] = BOQItem.objects.none()
+        elif db_field.name == 'category':
+            company = CompanyProfile.get_active(request)
+            if company:
+                kwargs['queryset'] = ExpenseCategory.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+        elif db_field.name == 'sub_category':
+            # Will be filtered by JS or form init
+            kwargs['queryset'] = SubExpense.objects.none()
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
@@ -752,10 +836,11 @@ class ProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         grand_profit = Decimal("0")
 
         total_manpower = Decimal("0")
+        payroll_filter = {'project': proj}
+        if company:
+            payroll_filter['payroll_record__employee__company'] = company
 
-        for cc in PayrollCostCenter.objects.filter(
-                project=proj, payroll_record__employee__company=company
-        ).select_related('payroll_record__employee'):
+        for cc in PayrollCostCenter.objects.filter(**payroll_filter).select_related('payroll_record__employee'):
             emp = cc.payroll_record.employee
             days = cc.days_count
             pr = cc.payroll_record
@@ -774,7 +859,11 @@ class ProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
             total_manpower += payroll_portion + admin_portion
 
-        for emp in Employee.objects.filter(project=proj, is_active=True, company=company):
+        emp_filter = {'project': proj, 'is_active': True}
+        if company:
+            emp_filter['company'] = company
+
+        for emp in Employee.objects.filter(**emp_filter):
             for pr in PayrollRecord.objects.filter(employee=emp):
                 if not pr.cost_centers.filter(project=proj).exists():
                     days_in_month = calendar.monthrange(pr.month.year, pr.month.month)[1]
@@ -976,11 +1065,14 @@ class ProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         <script>window.onload = function() {{ window.print(); }}</script>
     </body></html>"""
         return HttpResponse(html)
+#############
 
     def analytics_view(self, request, pk):
         company = self.get_active_company(request)
         proj = self.get_object_or_404_scoped(request, Project, pk=pk)
         invoices = Invoice.objects.filter(project=proj).order_by('inv_number')
+        if company:
+            invoices = invoices.filter(Q(project__company=company) | Q(project__company__isnull=True))
         boq_items = BOQItem.objects.filter(project=proj).order_by('item_number')
         logo_url = company.logo.url if company and company.logo else ''
 
@@ -1235,7 +1327,7 @@ class ProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     </table>
 </body></html>"""
         return HttpResponse(html)
-
+################################################
     def get_urls(self):
         urls = super().get_urls()
         custom = [
@@ -1369,7 +1461,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
     def ui_cumulative_work(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.cumulative_work_done:,.2f}</div>')
-    ui_cumulative_work.short_description = "Total Work Done"
+    ui_cumulative_work.short_description = "Total Certified Work"
 
     def ui_total_invoiced(self, obj):
         return mark_safe(
@@ -1653,7 +1745,6 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         return HttpResponse(html)
 
 
-
 # =============================================================================
 # COMPANY PROFILE ADMIN
 # =============================================================================
@@ -1681,7 +1772,8 @@ class SubExpenseInline(admin.TabularInline):
 
 
 @admin.register(ExpenseCategory)
-class ExpenseCategoryAdmin(admin.ModelAdmin):
+class ExpenseCategoryAdmin(CompanyScopedAdminMixin,admin.ModelAdmin):
+    company_field_path = 'company'
     list_display = ["name", "sub_expense_count"]
     inlines = [SubExpenseInline]
     search_fields = ["name"]
@@ -2025,6 +2117,12 @@ class PayrollCostCenterInline(admin.TabularInline):
         return mark_safe('<span style="color:#999;">—</span>')
     fmt_overtime_amount.short_description = "OT Amount"
 
+    def get_queryset(self, request):
+        qs = super().get_queryset(request)
+        company = CompanyProfile.get_active(request)
+        if company:
+            qs = qs.filter(project__company=company)
+        return qs
 
 class PayrollRecordAdminForm(forms.ModelForm):
     class Meta:
@@ -2165,7 +2263,7 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             path('<int:pk>/timesheet/', self.admin_site.admin_view(self.timesheet_view), name='payroll_timesheet'),
         ]
         return custom + urls
-
+#####################
     def timesheet_view(self, request, pk):
         company = self.get_active_company(request)
         payroll = self.get_object_or_404_scoped(request, PayrollRecord, pk=pk)
@@ -2640,7 +2738,7 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         return ''
 
     def _payroll_report_wrapper(self, title, headers, rows, totals, payment_method):
-        company = CompanyProfile.get_active(request)
+        company = CompanyProfile.get_active()
         logo_url = company.logo.url if company and company.logo else ''
         logo_bar_html = f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>' if logo_url else ''
 

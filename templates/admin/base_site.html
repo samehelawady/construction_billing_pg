@@ -1,22 +1,27 @@
-{% extends "admin/base.html" %}
+{% extends "admin/base_site.html" %}
 
 {% block branding %}
     {{ block.super }}
-    {% if company_switcher %}
-        <div style="display:inline-block;">
-            {{ company_switcher }}
-        </div>
+    {% if available_companies.count > 1 %}
+    <div style="display:inline-block; margin-left:20px; font-size:12px;">
+        <select onchange="window.location.href=this.value" style="font-size:11px; padding:2px;">
+            {% for c in available_companies %}
+            <option value="{% url 'switch_company' c.pk %}" {% if active_company and active_company.pk == c.pk %}selected{% endif %}>
+                {{ c.company_name }}
+            </option>
+            {% endfor %}
+        </select>
+    </div>
     {% endif %}
 {% endblock %}
 
 {% block extrastyle %}
-{{ block.super }}
 <style>
 /* ================================================================
-   CONSTRUCTION BILLING — ADMIN CHANGE LIST FIXES (INLINE)
+   CONSTRUCTION BILLING — ADMIN CHANGE LIST FIXES
    ================================================================ */
 
-/* ---- ROOT FIX: Force search bar to top, prevent float overlap ---- */
+/* ---- ROOT FIX: Force search bar to top ---- */
 #changelist {
     display: flex !important;
     flex-direction: column !important;
