@@ -1,0 +1,133 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block content %}
+<div class="reports-dashboard" style="padding: 20px; max-width: 1400px; margin: 0 auto;">
+
+    <!-- Header -->
+    <div style="margin-bottom: 30px; border-bottom: 3px solid #1a237e; padding-bottom: 15px;">
+        <h1 style="color: #1a237e; font-size: 24px; margin: 0; display: flex; align-items: center; gap: 12px;">
+            <span style="font-size: 28px;">📊</span>
+            Reports & Analytics Dashboard
+        </h1>
+        <p style="color: #666; margin: 8px 0 0 0; font-size: 13px;">
+            Access all reports from one centralized location. Select a report category below.
+        </p>
+    </div>
+
+    <!-- Company Info -->
+    {% if company %}
+    <div style="background: #e8eaf6; padding: 12px 16px; border-radius: 8px; margin-bottom: 24px; display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 16px;">🏢</span>
+        <span style="font-weight: 600; color: #1a237e;">{{ company.company_name }}</span>
+        <span style="color: #666;">|</span>
+        <span style="color: #666; font-size: 12px;">TRN: {{ company.trn_number|default:"N/A" }}</span>
+    </div>
+    {% endif %}
+
+    <!-- Report Categories Grid -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px;">
+        {% for category in report_categories %}
+        <div class="report-category" style="
+            background: white;
+            border: 1px solid #e0e0e0;
+            border-radius: 12px;
+            overflow: hidden;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+            transition: all 0.2s ease;
+        " onmouseover="this.style.boxShadow='0 4px 16px rgba(0,0,0,0.12)'"
+           onmouseout="this.style.boxShadow='0 2px 8px rgba(0,0,0,0.06)'">
+
+            <!-- Category Header -->
+            <div style="
+                background: {{ category.color }};
+                color: white;
+                padding: 16px 20px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            ">
+                <span style="font-size: 24px;">{{ category.icon }}</span>
+                <div>
+                    <div style="font-size: 16px; font-weight: 700;">{{ category.name }}</div>
+                    <div style="font-size: 11px; opacity: 0.9; margin-top: 2px;">{{ category.description }}</div>
+                </div>
+            </div>
+
+            <!-- Reports List -->
+            <div style="padding: 12px;">
+                {% for report in category.reports %}
+                <a href="{{ report.url }}" target="_blank" style="
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                    padding: 12px;
+                    border-radius: 8px;
+                    text-decoration: none;
+                    color: #333;
+                    transition: all 0.15s ease;
+                    margin-bottom: 8px;
+                " onmouseover="this.style.background='#f5f5f5'"
+                   onmouseout="this.style.background='transparent'">
+
+                    <div style="
+                        width: 40px;
+                        height: 40px;
+                        background: {{ category.color }}15;
+                        border-radius: 10px;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        font-size: 18px;
+                        flex-shrink: 0;
+                    ">
+                        {{ report.icon }}
+                    </div>
+
+                    <div style="flex: 1; min-width: 0;">
+                        <div style="font-weight: 600; font-size: 13px; margin-bottom: 2px; display: flex; align-items: center; gap: 8px;">
+                            {{ report.name }}
+                            <span style="
+                                font-size: 9px;
+                                padding: 2px 8px;
+                                border-radius: 10px;
+                                background: {{ category.color }}15;
+                                color: {{ category.color }};
+                                font-weight: 700;
+                            ">{{ report.badge }}</span>
+                        </div>
+                        <div style="font-size: 11px; color: #666; line-height: 1.4;">{{ report.description }}</div>
+                    </div>
+
+                    <span style="color: {{ category.color }}; font-size: 18px;">›</span>
+                </a>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- Quick Tips -->
+    <div style="
+        margin-top: 30px;
+        background: #fff8e1;
+        border: 1px solid #ffcc80;
+        border-radius: 8px;
+        padding: 16px 20px;
+        display: flex;
+        align-items: flex-start;
+        gap: 12px;
+    ">
+        <span style="font-size: 20px;">💡</span>
+        <div>
+            <div style="font-weight: 600; color: #e65100; margin-bottom: 4px; font-size: 13px;">Quick Tips</div>
+            <div style="font-size: 12px; color: #666; line-height: 1.6;">
+                • All reports open in a new tab for easy comparison<br>
+                • Use your browser's print function (Ctrl+P) to save as PDF<br>
+                • Reports automatically filter by your active company<br>
+                • Click any report card to launch the print-ready view
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

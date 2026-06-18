@@ -1,0 +1,328 @@
+{% extends "admin/app_index.html" %}
+{% load i18n static %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+    /* App Index styling */
+    .app-index-container {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 20px;
+    }
+
+    .app-header {
+        margin-bottom: 24px;
+        padding-bottom: 16px;
+        border-bottom: 3px solid #1a237e;
+    }
+
+    .app-header h1 {
+        color: #1a237e;
+        font-size: 22px;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .app-header p {
+        color: #666;
+        margin: 8px 0 0 0;
+        font-size: 13px;
+    }
+
+    /* Model Cards */
+    .models-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 16px;
+        margin-bottom: 30px;
+    }
+
+    .model-card {
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        transition: all 0.2s ease;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .model-card:hover {
+        box-shadow: 0 4px 16px rgba(0,0,0,0.1);
+        transform: translateY(-2px);
+        border-color: #1a237e;
+    }
+
+    .model-header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 12px;
+    }
+
+    .model-icon {
+        width: 44px;
+        height: 44px;
+        background: #e8eaf6;
+        border-radius: 10px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 20px;
+        flex-shrink: 0;
+    }
+
+    .model-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #1a237e;
+        margin: 0;
+    }
+
+    .model-meta {
+        font-size: 11px;
+        color: #666;
+        margin-top: 2px;
+    }
+
+    .model-description {
+        font-size: 12px;
+        color: #555;
+        line-height: 1.5;
+        margin-bottom: 16px;
+        flex-grow: 1;
+    }
+
+    .model-actions {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+    }
+
+    .model-action {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 6px 12px;
+        border-radius: 6px;
+        text-decoration: none;
+        font-size: 12px;
+        font-weight: 600;
+        transition: all 0.15s ease;
+    }
+
+    .model-action.primary {
+        background: #1a237e;
+        color: white;
+    }
+
+    .model-action.primary:hover {
+        background: #283593;
+    }
+
+    .model-action.secondary {
+        background: #f5f5f5;
+        color: #333;
+        border: 1px solid #ddd;
+    }
+
+    .model-action.secondary:hover {
+        background: #e8eaf6;
+        border-color: #1a237e;
+        color: #1a237e;
+    }
+
+    /* Breadcrumb */
+    .app-breadcrumb {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 16px;
+        font-size: 12px;
+        color: #666;
+    }
+
+    .app-breadcrumb a {
+        color: #1a237e;
+        text-decoration: none;
+        font-weight: 600;
+    }
+
+    .app-breadcrumb a:hover {
+        text-decoration: underline;
+    }
+
+    /* Section Divider */
+    .section-divider {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 30px 0 20px 0;
+        color: #1a237e;
+        font-size: 14px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    .section-divider::after {
+        content: '';
+        flex: 1;
+        height: 1px;
+        background: #e0e0e0;
+    }
+
+    /* Company Bar */
+    .company-bar {
+        background: #1a237e;
+        color: white;
+        padding: 12px 20px;
+        border-radius: 8px;
+        margin-bottom: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+
+    .company-bar .company-name {
+        font-weight: 700;
+        font-size: 14px;
+    }
+
+    /* Empty State */
+    .empty-state {
+        text-align: center;
+        padding: 60px 20px;
+        color: #999;
+    }
+
+    .empty-state-icon {
+        font-size: 64px;
+        margin-bottom: 16px;
+    }
+
+    .empty-state-title {
+        font-size: 18px;
+        font-weight: 700;
+        color: #333;
+        margin-bottom: 8px;
+    }
+
+    .empty-state-text {
+        font-size: 13px;
+        color: #666;
+        max-width: 400px;
+        margin: 0 auto;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="app-index-container">
+
+    <!-- Breadcrumb -->
+    <div class="app-breadcrumb">
+        <a href="{% url 'admin:index' %}">🏠 Dashboard</a>
+        <span>›</span>
+        <span>{{ app_list.0.name }}</span>
+    </div>
+
+    <!-- Company Bar -->
+    {% if active_company %}
+    <div class="company-bar">
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="font-size: 20px;">🏢</span>
+            <span class="company-name">{{ active_company.company_name }}</span>
+            {% if active_company.trn_number %}
+            <span style="opacity: 0.7; font-size: 12px;">| TRN: {{ active_company.trn_number }}</span>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- App Header -->
+    <div class="app-header">
+        <h1>
+            <span>📁</span>
+            {{ app_list.0.name }}
+        </h1>
+        <p>Manage {{ app_list.0.name|lower }} records and view reports.</p>
+    </div>
+
+    <!-- Models Grid -->
+    {% for app in app_list %}
+    <div class="models-grid">
+        {% for model in app.models %}
+        <div class="model-card">
+            <div class="model-header">
+                <div class="model-icon">
+                    {% if model.object_name == 'Client' %}👤
+                    {% elif model.object_name == 'Project' %}🏗️
+                    {% elif model.object_name == 'BOQItem' %}📋
+                    {% elif model.object_name == 'Invoice' %}📑
+                    {% elif model.object_name == 'InvoiceItem' %}📄
+                    {% elif model.object_name == 'CompanyProfile' %}🏢
+                    {% elif model.object_name == 'ExpenseCategory' %}📂
+                    {% elif model.object_name == 'SubExpense' %}📁
+                    {% elif model.object_name == 'Expense' %}💸
+                    {% elif model.object_name == 'Employee' %}👷
+                    {% elif model.object_name == 'EmployeeTransfer' %}🔄
+                    {% elif model.object_name == 'PayrollRecord' %}💰
+                    {% elif model.object_name == 'PayrollCostCenter' %}📍
+                    {% elif model.object_name == 'PayrollAllocation' %}⚖️
+                    {% elif model.object_name == 'PricingProject' %}💹
+                    {% elif model.object_name == 'PricingBOQItem' %}📊
+                    {% elif model.object_name == 'ReportsDashboard' %}📈
+                    {% else %}📦{% endif %}
+                </div>
+                <div>
+                    <div class="model-title">{{ model.name }}</div>
+                    <div class="model-meta">{{ model.object_name }}</div>
+                </div>
+            </div>
+
+            <div class="model-description">
+                {% if model.object_name == 'Client' %}Manage client information, contact details, and view client reports.
+                {% elif model.object_name == 'Project' %}Create and manage construction projects with BOQ and invoicing.
+                {% elif model.object_name == 'BOQItem' %}Bill of Quantities items linked to projects.
+                {% elif model.object_name == 'Invoice' %}Generate tax and proforma invoices with print-ready reports.
+                {% elif model.object_name == 'CompanyProfile' %}Configure company settings, logo, and bank details.
+                {% elif model.object_name == 'Expense' %}Track project expenses and allocate to BOQ items.
+                {% elif model.object_name == 'Employee' %}Manage staff and workers with payroll integration.
+                {% elif model.object_name == 'PayrollRecord' %}Monthly payroll records with timesheet and cost reports.
+                {% elif model.object_name == 'PricingProject' %}Create pricing estimates for new projects.
+                {% elif model.object_name == 'ReportsDashboard' %}Central hub for all printable reports and analytics.
+                {% else %}Manage {{ model.name|lower }} records.{% endif %}
+            </div>
+
+            <div class="model-actions">
+                {% if model.admin_url %}
+                <a href="{{ model.admin_url }}" class="model-action primary">
+                    <span>📋</span> List
+                </a>
+                {% endif %}
+                {% if model.add_url %}
+                <a href="{{ model.add_url }}" class="model-action secondary">
+                    <span>➕</span> Add
+                </a>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% empty %}
+    <div class="empty-state">
+        <div class="empty-state-icon">📭</div>
+        <div class="empty-state-title">No Models Available</div>
+        <div class="empty-state-text">
+            You don't have permission to view any models in this app, or no models are registered.
+        </div>
+    </div>
+    {% endfor %}
+
+</div>
+{% endblock %}

@@ -1,0 +1,679 @@
+{% extends "admin/index.html" %}
+{% load i18n static %}
+{% load humanize %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+    /* Dashboard styling */
+    .dashboard-container {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 20px;
+    }
+
+    .dashboard-header {
+        margin-bottom: 24px;
+        padding-bottom: 16px;
+        border-bottom: 3px solid #1a237e;
+    }
+
+    .dashboard-header h1 {
+        color: #1a237e;
+        font-size: 22px;
+        margin: 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    /* Metrics Cards */
+    .metrics-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 16px;
+        margin-bottom: 30px;
+    }
+
+    .metric-card {
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 20px;
+        text-align: center;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        transition: all 0.2s ease;
+    }
+
+    .metric-card:hover {
+        box-shadow: 0 4px 16px rgba(0,0,0,0.1);
+        transform: translateY(-2px);
+    }
+
+    .metric-icon {
+        font-size: 28px;
+        margin-bottom: 8px;
+    }
+
+    .metric-value {
+        font-size: 22px;
+        font-weight: 700;
+        margin-bottom: 4px;
+    }
+
+    .metric-value.primary { color: #1a237e; }
+    .metric-value.success { color: #2e7d32; }
+    .metric-value.warning { color: #f57c00; }
+    .metric-value.danger { color: #c62828; }
+    .metric-value.info { color: #0277bd; }
+
+    .metric-label {
+        font-size: 11px;
+        color: #666;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+
+    /* Recent Invoices Section */
+    .dashboard-section {
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 24px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }
+
+    .section-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 16px;
+        padding-bottom: 12px;
+        border-bottom: 2px solid #1a237e;
+    }
+
+    .section-title {
+        font-size: 15px;
+        font-weight: 700;
+        color: #1a237e;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+
+    .section-link {
+        font-size: 12px;
+        color: #1a237e;
+        text-decoration: none;
+        font-weight: 600;
+    }
+
+    .section-link:hover {
+        text-decoration: underline;
+    }
+
+    /* Invoice Table */
+    .invoice-table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+    }
+
+    .invoice-table th {
+        background: #f5f5f5;
+        padding: 10px 12px;
+        text-align: left;
+        font-weight: 600;
+        color: #333;
+        border-bottom: 2px solid #ddd;
+        font-size: 11px;
+        text-transform: uppercase;
+    }
+
+    .invoice-table td {
+        padding: 10px 12px;
+        border-bottom: 1px solid #eee;
+        vertical-align: middle;
+    }
+
+    .invoice-table tr:hover {
+        background: #f8f9fa;
+    }
+
+    .invoice-table .num {
+        text-align: right;
+        font-weight: 600;
+    }
+
+    .invoice-table .status-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 10px;
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+    }
+
+    .status-paid { background: #e8f5e9; color: #2e7d32; }
+    .status-pending { background: #fff3e0; color: #f57c00; }
+    .status-draft { background: #e3f2fd; color: #0277bd; }
+    .status-approved { background: #e8eaf6; color: #1a237e; }
+
+    /* Project Progress */
+    .progress-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+        gap: 16px;
+    }
+
+    .progress-card {
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 16px;
+        background: white;
+    }
+
+    .progress-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 10px;
+    }
+
+    .progress-project {
+        font-weight: 700;
+        font-size: 13px;
+        color: #1a237e;
+    }
+
+    .progress-pct {
+        font-size: 14px;
+        font-weight: 700;
+        color: #2e7d32;
+    }
+
+    .progress-bar-track {
+        width: 100%;
+        height: 8px;
+        background: #e0e0e0;
+        border-radius: 4px;
+        overflow: hidden;
+        margin-bottom: 8px;
+    }
+
+    .progress-bar-fill {
+        height: 100%;
+        background: linear-gradient(90deg, #1a237e, #2e7d32);
+        border-radius: 4px;
+        transition: width 0.5s ease;
+    }
+
+    .progress-meta {
+        display: flex;
+        justify-content: space-between;
+        font-size: 11px;
+        color: #666;
+    }
+
+    /* Empty State */
+    .empty-state {
+        text-align: center;
+        padding: 40px;
+        color: #999;
+    }
+
+    .empty-state-icon {
+        font-size: 48px;
+        margin-bottom: 12px;
+    }
+
+    /* Company Selector */
+    .company-bar {
+        background: #1a237e;
+        color: white;
+        padding: 12px 20px;
+        border-radius: 8px;
+        margin-bottom: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+    }
+
+    .company-name {
+        font-weight: 700;
+        font-size: 14px;
+    }
+
+    .company-selector {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+
+    .company-selector select {
+        padding: 6px 12px;
+        border-radius: 4px;
+        border: none;
+        font-size: 12px;
+        background: rgba(255,255,255,0.15);
+        color: white;
+        cursor: pointer;
+    }
+
+    .company-selector select option {
+        background: #1a237e;
+        color: white;
+    }
+
+    /* Quick Actions */
+    .quick-actions {
+        display: flex;
+        gap: 12px;
+        margin-bottom: 24px;
+        flex-wrap: wrap;
+    }
+
+    .quick-action-btn {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 18px;
+        background: white;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        text-decoration: none;
+        color: #333;
+        font-size: 12px;
+        font-weight: 600;
+        transition: all 0.2s ease;
+    }
+
+    .quick-action-btn:hover {
+        background: #1a237e;
+        color: white;
+        border-color: #1a237e;
+    }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="dashboard-container">
+
+    <!-- Company Bar -->
+    {% if active_company %}
+    <div class="company-bar">
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <span style="font-size: 20px;">🏢</span>
+            <span class="company-name">{{ active_company.company_name }}</span>
+            {% if active_company.trn_number %}
+            <span style="opacity: 0.7; font-size: 12px;">| TRN: {{ active_company.trn_number }}</span>
+            {% endif %}
+        </div>
+        {% if available_companies.count > 1 %}
+        <div class="company-selector">
+            <span style="font-size: 12px; opacity: 0.8;">Switch Company:</span>
+            <form method="post" action="{% url 'admin:switch_company' %}" style="margin: 0;">
+                {% csrf_token %}
+                <select name="company_id" onchange="this.form.submit()">
+                    {% for c in available_companies %}
+                    <option value="{{ c.id }}" {% if c.id == active_company.id %}selected{% endif %}>
+                        {{ c.company_name }}
+                    </option>
+                    {% endfor %}
+                </select>
+            </form>
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+
+    <!-- Dashboard Header -->
+    <div class="dashboard-header">
+        <h1>
+            <span>📊</span>
+            {{ index_title|default:"Dashboard" }}
+        </h1>
+        <p style="color: #666; margin: 8px 0 0 0; font-size: 13px;">
+            Overview of your business metrics, recent activity, and project progress.
+        </p>
+    </div>
+
+    <!-- Quick Actions -->
+    <div class="quick-actions">
+        <a href="{% url 'admin:billing_invoice_add' %}" class="quick-action-btn">
+            <span>📝</span> New Invoice
+        </a>
+        <a href="{% url 'admin:billing_project_add' %}" class="quick-action-btn">
+            <span>🏗️</span> New Project
+        </a>
+        <a href="{% url 'admin:billing_client_add' %}" class="quick-action-btn">
+            <span>👤</span> New Client
+        </a>
+        <a href="{% url 'admin:billing_reportsdashboard_changelist' %}" class="quick-action-btn">
+            <span>📊</span> Reports
+        </a>
+        <a href="{% url 'admin:billing_employee_add' %}" class="quick-action-btn">
+            <span>👷</span> New Employee
+        </a>
+    </div>
+
+    <!-- Metrics -->
+    {% if dashboard_metrics %}
+    <div class="metrics-grid">
+        {% for metric in dashboard_metrics %}
+        <div class="metric-card">
+            <div class="metric-icon">{{ metric.icon }}</div>
+            <div class="metric-value {{ metric.color }}">{{ metric.value|intcomma }}</div>
+            <div class="metric-label">{{ metric.label }}</div>
+        </div>
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- Recent Invoices -->
+    {% if recent_invoices %}
+    <div class="dashboard-section">
+        <div class="section-header">
+            <div class="section-title">
+                <span>📑</span>
+                Recent Invoices
+            </div>
+            <a href="{% url 'admin:billing_invoice_changelist' %}" class="section-link">
+                View All →
+            </a>
+        </div>
+<table class="invoice-table">
+    <thead>
+        <tr>
+            <th>Invoice</th>
+            <th>Project</th>
+            <th>Client</th>
+            <th>Date</th>
+            <th class="num" style="text-align: right;">Amount</th>
+            <th>Status</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for inv in recent_invoices %}
+        <tr>
+            <td><strong>{{ inv }}</strong></td>
+            <td>{{ inv.project.project_name }}</td>
+            <td>{{ inv.project.client.name }}</td>
+            <td>{{ inv.date|date:"d-M-Y" }}</td>
+            <td class="num" style="text-align: right; white-space: nowrap;">
+                <span style="float: left; color: #666; font-weight: normal;">AED</span>
+                <span style="font-weight: 600;">{{ inv.total_after_vat|floatformat:2|intcomma }}</span>
+            </td>
+            <td>
+                <span class="status-badge status-{{ inv.status|lower }}">
+                    {{ inv.status }}
+                </span>
+            </td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+    </div>
+    {% endif %}
+
+    <!-- Project Progress -->
+    {% if project_progress %}
+    <div class="dashboard-section">
+        <div class="section-header">
+            <div class="section-title">
+                <span>📈</span>
+                Project Progress
+            </div>
+            <a href="{% url 'admin:billing_project_changelist' %}" class="section-link">
+                View All →
+            </a>
+        </div>
+        <div class="progress-grid">
+            {% for proj in project_progress %}
+            <div class="progress-card">
+                <div class="progress-header">
+                    <div class="progress-project">{{ proj.project.project_id_code }}</div>
+                    <div class="progress-pct">{{ proj.progress|floatformat:1 }}%</div>
+                </div>
+                <div class="progress-bar-track">
+                    <div class="progress-bar-fill" style="width: {{ proj.progress|floatformat:0 }}%;"></div>
+                </div>
+                <div class="progress-meta">
+                    <span>Work Done: AED {{ proj.work_done|floatformat:0 }}</span>
+                    <span>PO: AED {{ proj.po_amount|floatformat:0 }}</span>
+                </div>
+                <div style="margin-top: 6px; font-size: 11px; color: #666;">
+                    {{ proj.project.project_name|truncatechars:40 }}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Default Admin App List (if no custom content) -->
+    {% if not dashboard_metrics and not recent_invoices %}
+    {{ block.super }}
+    {% endif %}
+
+</div>
+{# ── Load Chart.js from CDN ── #}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+<style>
+.dashboard-charts-wrapper {
+    margin: 24px 0;
+}
+.project-charts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 14px;
+    margin-bottom: 28px;
+}
+.project-chart-card {
+    background: #ffffff;
+    border: 1px solid #dee2e6;
+    border-radius: 8px;
+    padding: 10px 10px 6px 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.06);
+}
+.project-chart-card h4 {
+    font-size: 10px;
+    font-weight: 700;
+    color: #1a237e;
+    margin: 0 0 6px 0;
+    text-align: center;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+}
+.project-chart-card canvas {
+    height: 130px !important;
+    width: 100% !important;
+}
+.overall-chart-box {
+    background: #ffffff;
+    border: 1px solid #dee2e6;
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+}
+.overall-chart-box h3 {
+    font-size: 13px;
+    font-weight: 700;
+    color: #1a237e;
+    margin: 0 0 14px 0;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+.overall-chart-box canvas {
+    height: 320px !important;
+    width: 100% !important;
+}
+</style>
+
+<div class="dashboard-charts-wrapper">
+
+    {# ── Per-Project Mini Charts ── #}
+    <h3 style="font-size:12px; color:#1a237e; margin-bottom:10px; text-transform:uppercase; letter-spacing:0.5px;">
+        📊 Project Cost Breakdown
+    </h3>
+    <div class="project-charts-grid">
+        {% for chart in project_charts %}
+        <div class="project-chart-card">
+            <h4>{{ chart.code }} — {{ chart.name }}</h4>
+            <canvas id="projChart{{ chart.id }}"></canvas>
+        </div>
+        {% empty %}
+        <div style="color:#999; text-align:center; padding:20px; font-size:12px;">No projects found.</div>
+        {% endfor %}
+    </div>
+
+    {# ── Overall Combo Chart ── #}
+    <div class="overall-chart-box">
+        <h3>🏗️ Overall Project Performance — Revenue vs Expenses vs P&amp;L</h3>
+        <canvas id="overallChart"></canvas>
+    </div>
+
+</div>
+
+<script>
+(function() {
+    'use strict';
+
+    // ── Mini chart defaults ──
+    const miniDefaults = {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+            legend: { display: false },
+            tooltip: {
+                callbacks: {
+                    label: function(ctx) {
+                        return 'AED ' + ctx.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+                    }
+                }
+            }
+        },
+        scales: {
+            y: {
+                beginAtZero: true,
+                ticks: {
+                    font: { size: 8 },
+                    callback: function(v) { return v >= 1000 ? (v/1000).toFixed(0)+'k' : v; }
+                },
+                grid: { color: '#f0f0f0' }
+            },
+            x: {
+                ticks: { font: { size: 8 } },
+                grid: { display: false }
+            }
+        }
+    };
+
+    // ── Render per-project charts ──
+    {% for chart in project_charts %}
+    new Chart(document.getElementById('projChart{{ chart.id }}'), {
+        type: 'bar',
+        data: {
+            labels: ['Revenue', 'Dir.Exp', 'Manpower'],
+            datasets: [{
+                data: [{{ chart.revenue }}, {{ chart.direct_expenses }}, {{ chart.manpower }}],
+                backgroundColor: ['#1a237e', '#ed6c02', '#d32f2f'],
+                borderRadius: 3,
+                barThickness: 18
+            }]
+        },
+        options: miniDefaults
+    });
+    {% endfor %}
+
+    // ── Render overall combo chart ──
+    const overallLabels = {{ overall_chart.labels_json|safe }};
+    const overallRevenues = {{ overall_chart.revenues_json|safe }};
+    const overallExpenses = {{ overall_chart.expenses_json|safe }};
+    const overallProfits = {{ overall_chart.profits_json|safe }};
+
+    new Chart(document.getElementById('overallChart'), {
+        type: 'bar',
+        data: {
+            labels: overallLabels,
+            datasets: [
+                {
+                    type: 'bar',
+                    label: 'Revenue (Certified Work)',
+                    data: overallRevenues,
+                    backgroundColor: '#1a237e',
+                    borderRadius: 4,
+                    order: 2
+                },
+                {
+                    type: 'bar',
+                    label: 'Total Expenses',
+                    data: overallExpenses,
+                    backgroundColor: '#ed6c02',
+                    borderRadius: 4,
+                    order: 3
+                },
+                {
+                    type: 'line',
+                    label: 'Profit / Loss',
+                    data: overallProfits,
+                    borderColor: '#2e7d32',
+                    backgroundColor: '#2e7d32',
+                    borderWidth: 2,
+                    pointRadius: 4,
+                    pointBackgroundColor: '#fff',
+                    pointBorderWidth: 2,
+                    tension: 0.3,
+                    order: 1
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { boxWidth: 12, font: { size: 11 }, padding: 12 }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(ctx) {
+                            let lbl = ctx.dataset.label || '';
+                            if (lbl) lbl += ': ';
+                            lbl += 'AED ' + ctx.parsed.y.toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+                            return lbl;
+                        }
+                    }
+                }
+            },
+            scales: {
+                y: {
+                    beginAtZero: true,
+                    ticks: {
+                        font: { size: 10 },
+                        callback: function(v) {
+                            if (Math.abs(v) >= 1000000) return (v/1000000).toFixed(1)+'M';
+                            if (Math.abs(v) >= 1000) return (v/1000).toFixed(0)+'k';
+                            return v;
+                        }
+                    },
+                    grid: { color: '#e9ecef' }
+                },
+                x: {
+                    ticks: { font: { size: 10 } },
+                    grid: { display: false }
+                }
+            }
+        }
+    });
+})();
+</script>
+{% endblock %}

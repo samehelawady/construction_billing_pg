@@ -1,0 +1,201 @@
+{% extends "admin/base_site.html" %}
+{% load i18n static %}
+
+{% block content %}
+<div id="content-main">
+
+  {% if tree_companies %}
+    <div class="admin-tree">
+      {% for comp in tree_companies %}
+      <div class="tree-company">
+        <div class="tree-header company-header" onclick="toggleTree(this)">
+          <span class="tree-icon">▼</span>
+          <strong>{{ comp.company.company_name }}</strong>
+          <span class="tree-badge">{{ comp.clients|length }} clients</span>
+        </div>
+
+        <div class="tree-body">
+          <!-- CLIENTS & PROJECTS -->
+          <div class="tree-group">
+            <div class="tree-group-header" onclick="toggleTree(this)">
+              <span class="tree-icon">▼</span> Clients & Projects
+            </div>
+            <div class="tree-group-body">
+              {% if comp.clients %}
+                {% for cdata in comp.clients %}
+                <div class="tree-client">
+                  <div class="tree-client-header" onclick="toggleTree(this)">
+                    <span class="tree-icon">▼</span>
+                    {{ cdata.client.name }}
+                  </div>
+                  <div class="tree-client-body">
+                    <div class="tree-links">
+                      <a href="{% url 'admin:billing_project_changelist' %}?client__id__exact={{ cdata.client.id }}&company__id__exact={{ comp.company.id }}">
+                        📁 Projects ({{ cdata.project_count }})
+                      </a>
+                      <a href="{% url 'admin:billing_invoice_changelist' %}?project__client__id__exact={{ cdata.client.id }}&project__company__id__exact={{ comp.company.id }}">
+                        🧾 Invoices ({{ cdata.invoice_count }})
+                      </a>
+                      <a href="{% url 'admin:billing_boqitem_changelist' %}?project__client__id__exact={{ cdata.client.id }}&project__company__id__exact={{ comp.company.id }}">
+                        📋 BOQ Items
+                      </a>
+                    </div>
+                    {% if cdata.projects %}
+                    <div class="tree-projects">
+                      {% for proj in cdata.projects %}
+                      <a class="tree-project-link" href="{% url 'admin:billing_project_change' proj.id %}">
+                        ▸ {{ proj.project_id_code }} — {{ proj.project_name }}
+                      </a>
+                      {% endfor %}
+                    </div>
+                    {% endif %}
+                  </div>
+                </div>
+                {% endfor %}
+              {% else %}
+                <div class="tree-empty">No clients for this company.</div>
+              {% endif %}
+            </div>
+          </div>
+
+          <!-- EMPLOYEES -->
+          <div class="tree-group">
+            <div class="tree-group-header" onclick="toggleTree(this)">
+              <span class="tree-icon">▼</span> Employees ({{ comp.employee_count }})
+            </div>
+            <div class="tree-group-body">
+              <div class="tree-links">
+                <a href="{% url 'admin:billing_employee_changelist' %}?company__id__exact={{ comp.company.id }}">
+                  👷 All Employees
+                </a>
+                <a href="{% url 'admin:billing_payrollrecord_changelist' %}?employee__company__id__exact={{ comp.company.id }}">
+                  💰 Payroll Records
+                </a>
+                <a href="{% url 'admin:billing_employeetransfer_changelist' %}?employee__company__id__exact={{ comp.company.id }}">
+                  🔄 Transfers
+                </a>
+              </div>
+            </div>
+          </div>
+
+          <!-- EXPENSES -->
+          <div class="tree-group">
+            <div class="tree-group-header" onclick="toggleTree(this)">
+              <span class="tree-icon">▼</span> Expenses
+            </div>
+            <div class="tree-group-body">
+              <div class="tree-links">
+                <a href="{% url 'admin:billing_expense_changelist' %}?project__company__id__exact={{ comp.company.id }}">
+                  📊 All Expenses
+                </a>
+                <a href="{% url 'admin:billing_expensecategory_changelist' %}?company__id__exact={{ comp.company.id }}">
+                  🏷️ Categories ({{ comp.expense_cats|length }})
+                </a>
+              </div>
+            </div>
+          </div>
+
+          <!-- PRICING -->
+          <div class="tree-group">
+            <div class="tree-group-header" onclick="toggleTree(this)">
+              <span class="tree-icon">▼</span> Pricing
+            </div>
+            <div class="tree-group-body">
+              <div class="tree-links">
+                <a href="{% url 'admin:billing_pricingproject_changelist' %}?company__id__exact={{ comp.company.id }}">
+                  💼 Pricing Projects ({{ comp.pricing_projects|length }})
+                </a>
+              </div>
+            </div>
+          </div>
+
+          <!-- REPORTS -->
+          <div class="tree-group">
+            <div class="tree-group-header" onclick="toggleTree(this)">
+              <span class="tree-icon">▼</span> Payroll Reports
+            </div>
+            <div class="tree-group-body">
+              <div class="tree-links">
+                <a href="{% url 'admin:payroll_labor_cost' %}">📈 Labor Cost</a>
+                <a href="{% url 'admin:payroll_staff_report' %}">🏢 Staff Report</a>
+                <a href="{% url 'admin:payroll_wps_report' %}">🚧 WPS Report</a>
+                <a href="{% url 'admin:payroll_cash_report' %}">💵 Cash Report</a>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <!-- FALLBACK: show standard Django app list if tree data is missing -->
+    {% if app_list %}
+      <div id="app-list">
+        {% for app in app_list %}
+          <div class="app-{{ app.app_label }} module">
+            <table>
+              <caption><a href="{{ app.app_url }}" class="section">{{ app.name }}</a></caption>
+              {% for model in app.models %}
+                <tr>
+                  <th scope="row"><a href="{{ model.admin_url }}">{{ model.name }}</a></th>
+                  <td><a href="{{ model.add_url }}" class="addlink">Add</a></td>
+                  <td><a href="{{ model.admin_url }}" class="changelink">Change</a></td>
+                </tr>
+              {% endfor %}
+            </table>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p>{% trans "You don't have permission to view anything." %}</p>
+    {% endif %}
+  {% endif %}
+</div>
+
+<style>
+/* ── Tree Styles ── */
+.admin-tree { max-width: 1000px; font-family: "Segoe UI", system-ui, sans-serif; }
+.tree-company { margin-bottom: 10px; border: 1px solid #ccc; border-radius: 8px; overflow: hidden; background: #fff; }
+.tree-header { padding: 14px 18px; cursor: pointer; display: flex; align-items: center; gap: 12px; font-size: 15px; }
+.company-header { background: #000080; color: white; }
+.company-header .tree-badge { margin-left: auto; background: rgba(255,255,255,0.2); padding: 2px 10px; border-radius: 12px; font-size: 12px; }
+.tree-group { border-top: 1px solid #e0e0e0; }
+.tree-group-header { padding: 10px 18px; cursor: pointer; background: #f8f9fa; color: #000080; font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 10px; }
+.tree-group-body { padding: 8px 18px 12px 18px; background: #fff; }
+.tree-client { margin: 6px 0 6px 12px; border-left: 2px solid #2e7d32; }
+.tree-client-header { padding: 8px 12px; cursor: pointer; background: #f0f8f0; color: #2e7d32; font-weight: 500; font-size: 12px; display: flex; align-items: center; gap: 8px; border-radius: 0 4px 4px 0; }
+.tree-client-body { padding: 6px 12px; }
+.tree-links { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+.tree-links a { color: #333; text-decoration: none; padding: 5px 10px; border-radius: 4px; background: #f5f5f5; border: 1px solid #e0e0e0; font-size: 12px; transition: all 0.15s; }
+.tree-links a:hover { background: #000080; color: white; border-color: #000080; }
+.tree-projects { display: flex; flex-direction: column; gap: 3px; padding-left: 8px; }
+.tree-project-link { color: #555; text-decoration: none; font-size: 11px; padding: 3px 6px; border-radius: 3px; }
+.tree-project-link:hover { background: #e3f2fd; color: #000080; }
+.tree-empty { color: #999; font-style: italic; font-size: 12px; padding: 8px; }
+.tree-icon { font-size: 10px; width: 14px; display: inline-block; transition: transform 0.2s; }
+.collapsed .tree-icon { transform: rotate(-90deg); }
+.collapsed + .tree-body, .collapsed + .tree-group-body, .collapsed + .tree-client-body { display: none; }
+</style>
+
+<script>
+function toggleTree(header) {
+  header.classList.toggle('collapsed');
+}
+// Expand first company, collapse others
+document.addEventListener('DOMContentLoaded', function() {
+  const companies = document.querySelectorAll('.tree-company');
+  companies.forEach((comp, idx) => {
+    const body = comp.querySelector('.tree-body');
+    const groups = comp.querySelectorAll('.tree-group-header, .tree-client-header');
+    if (idx === 0) {
+      // First company: expand company, collapse its groups
+      groups.forEach(g => g.classList.add('collapsed'));
+    } else {
+      // Others: collapse everything
+      comp.querySelector('.tree-header').classList.add('collapsed');
+    }
+  });
+});
+</script>
+{% endblock %}

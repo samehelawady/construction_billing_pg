@@ -38,6 +38,7 @@ class Client(models.Model):
 
 class CompanyProfile(models.Model):
     class Meta:
+        app_label = 'billing'
         verbose_name = "Company Profile"
         verbose_name_plural = "Company Profiles"
 
@@ -65,6 +66,8 @@ class CompanyProfile(models.Model):
         default=False,
         help_text="Check this to make this the active company for branding, reports and the admin header."
     )
+    contact_person = models.CharField(max_length=100, blank=True)  # e.g. "Eng. Sherif Hemaya"
+    contact_title = models.CharField(max_length=100, blank=True)  # e.g. "General Manager"
 
     def __str__(self):
         return self.company_name
@@ -124,6 +127,13 @@ class Project(models.Model):
         editable=False,
         help_text="Automatically set to True when BOQ total matches PO Amount."
     )
+    amendment_amount = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+    variation_amount = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+    back_charges = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+    estimated_back_charges = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+    liquidated_damages = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+    advance_paid = models.DecimalField(max_digits=15, decimal_places=2, default=Decimal("0"))
+
 
     class Meta:
         ordering = ['project_id_code']
@@ -163,6 +173,11 @@ class BOQItem(models.Model):
     unit = models.CharField(max_length=10, choices=UNIT_CHOICES, default="LS")
     quantity = models.DecimalField(max_digits=12, decimal_places=2, default=0)
     rate = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    is_executed = models.BooleanField(
+        default=True,
+        help_text="Uncheck if this BOQ item was not executed / omitted from project scope. "
+                  "Non-executed items will appear in red on the final invoice with 'NOT EXECUTED' label."
+    )
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
@@ -188,6 +203,11 @@ class Invoice(models.Model):
     revision = models.IntegerField(default=0)
     date = models.DateField()
     is_advance_invoice = models.BooleanField(default=False)
+    is_final_invoice = models.BooleanField(
+        default=False,
+        help_text="Check this if this is the final invoice for the project. "
+                  "Any remaining advance balance will be fully recovered on this invoice."
+    )
 
     RETENTION_RECOVERY_CHOICES = [
         ('', 'None'),
@@ -322,8 +342,31 @@ class Invoice(models.Model):
     def cumulative_advance_recovered(self):
         if self.is_advance_invoice or not self.was_advance_taken:
             return Decimal("0.00")
+        if self.is_final_invoice:
+            return self.project.total_advance_value
         recovery = money(self.cumulative_work_done * (self.project.advance_percent / 100))
         return min(recovery, self.project.total_advance_value)
+
+    @property
+    def previous_advance_recovered(self):
+        prev = Invoice.objects.filter(project=self.project, inv_number__lt=self.inv_number,
+                                      is_advance_invoice=False).order_by('-inv_number').first()
+        return prev.cumulative_advance_recovered if prev else Decimal("0.00")
+
+    @property
+    def current_advance_recovery(self):
+        if self.is_advance_invoice or not self.was_advance_taken:
+            return Decimal("0.00")
+        if self.is_final_invoice:
+            remaining = money(self.project.total_advance_value - self.previous_advance_recovered)
+            return max(remaining, Decimal("0.00"))
+        return money(self.cumulative_advance_recovered - self.previous_advance_recovered)
+
+    @property
+    def advance_balance_remaining(self):
+        if not self.was_advance_taken:
+            return Decimal("0.00")
+        return money(self.project.total_advance_value - self.cumulative_advance_recovered)
 
     @property
     def previous_advance_recovered(self):
@@ -469,16 +512,61 @@ class Invoice(models.Model):
         return money(self.net_total_invoiced_cumulative - self.previous_net_total_invoiced)
 
     @property
-    def vat_amount(self):
-        return money(self.current_net_before_vat * (self.vat_percent / 100))
+    def materials_exclusive(self):
+        """Materials supplied by client — VAT exclusive deduction."""
+        return self.material_supplied_by_client or Decimal("0.00")
+
+    # MODIFIED: Net VAT Base should clearly separate materials
+    @property
+    def net_vat_base(self):
+        """Net amount for VAT calculation: work done minus materials (materials are client-supplied, no VAT charged on them)."""
+        base = self.current_net_before_vat - self.materials_exclusive
+        return money(base) if base > 0 else Decimal("0.00")
 
     @property
+    def vat_amount(self):
+        return money(self.net_vat_base * (self.vat_percent / 100))
+
+    # MODIFIED: Total with VAT = work done VAT only (materials VAT is separate input VAT)
+    @property
     def total_with_vat(self):
-        return money(self.current_net_before_vat + self.vat_amount)
+        """Total including VAT on work done only. Materials VAT is separate input VAT."""
+        return money(self.net_vat_base + self.vat_on_work_done)
 
     @property
     def total_after_vat(self):
-        return money(self.total_with_vat - self.material_supplied_by_client)
+        return self.total_with_vat
+
+    @property
+    def variation_total(self):
+        """Total net amount of all variation orders on this invoice."""
+        return money(
+            self.variation_orders.aggregate(total=Sum('amount'))['total'] or Decimal("0")
+        )
+
+    @property
+    def variation_vat(self):
+        """VAT on variations."""
+        return money(self.variation_total * (self.vat_percent / Decimal("100")))
+
+    @property
+    def variation_total_with_vat(self):
+        """Total variations including VAT."""
+        return money(self.variation_total + self.variation_vat)
+
+    @property
+    def current_net_before_vat_with_variations(self):
+        """Base invoice net + variations (before VAT)."""
+        return money(self.current_net_before_vat + self.variation_total)
+
+    @property
+    def total_with_vat_including_variations(self):
+        """Total payable including VAT and variations."""
+        # Base invoice VAT + variation VAT, added to net base
+        base_vat = self.vat_amount  # VAT on work done (already excludes materials)
+        var_vat = self.variation_vat
+        return money(self.current_net_before_vat + self.variation_total + base_vat + var_vat)
+
 
     def save(self, *args, **kwargs):
         if self.inv_number is None:
@@ -491,6 +579,15 @@ class Invoice(models.Model):
                                                                   defaults={'rate': boq.rate})
                 item.save()
 
+    @property
+    def vat_on_materials(self):
+        """VAT on materials supplied by client - this is input VAT (5% on materials)."""
+        return money(self.materials_exclusive * (self.vat_percent / 100))
+
+    @property
+    def vat_on_work_done(self):
+        """VAT on current work done (output VAT) - calculated on net work after materials deduction."""
+        return self.vat_amount  # Existing property already calculates this correctly
 
 class InvoiceItem(models.Model):
     invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name="items")
@@ -553,7 +650,72 @@ class InvoiceItem(models.Model):
             self.gross_amount - self.retention_a_amount - self.retention_b_amount - self.advance_amount)
         super().save(*args, **kwargs)
 
+class VariationOrder(models.Model):
+    """
+    Variation Order - additional work not in original BOQ/scope.
+    No retention or advance recovery applies to variations.
+    """
+    invoice = models.ForeignKey(
+        'Invoice',
+        on_delete=models.CASCADE,
+        related_name='variation_orders',
+        help_text="The invoice this variation appears on"
+    )
+    description = models.TextField(help_text="Description of the variation work")
+    amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=0,
+        help_text="Net amount for this variation (before VAT)"
+    )
+    vat_amount = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=0,
+        editable=False
+    )
+    total_with_vat = models.DecimalField(
+        max_digits=15,
+        decimal_places=2,
+        default=0,
+        editable=False
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        verbose_name = "Variation Order"
+        verbose_name_plural = "Variation Orders"
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"VO-{self.id}: {self.description[:50]}... ({self.amount:,.2f})"
+
+    def save(self, *args, **kwargs):
+        vat_rate = self.invoice.vat_percent or Decimal("5")
+        self.vat_amount = money(self.amount * (vat_rate / Decimal("100")))
+        self.total_with_vat = money(self.amount + self.vat_amount)
+        super().save(*args, **kwargs)
+
+    def _count_completed_projects(self, company):
+        """Count projects with final paid tax invoice and all retention recovered."""
+        if not company:
+            return 0
+        completed = 0
+        for proj in Project.objects.filter(company=company):
+            final_inv = Invoice.objects.filter(
+                project=proj, inv_type='T', is_final_invoice=True, status='Paid'
+            ).first()
+            if not final_inv:
+                continue
+            latest_inv = Invoice.objects.filter(
+                project=proj, inv_type='T'
+            ).exclude(is_advance_invoice=True).order_by('-inv_number').first()
+            if latest_inv:
+                ret_total = latest_inv.cumulative_retention_total
+                ret_recovered = latest_inv.cumulative_retention_a_recovered + latest_inv.cumulative_retention_b_recovered
+                if ret_total <= ret_recovered:
+                    completed += 1
+        return completed
 # =============================================================================
 # SECTION 2: EXPENSES
 # =============================================================================

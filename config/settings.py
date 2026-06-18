@@ -37,6 +37,8 @@ DEBUG = os.getenv('DEBUG', 'True').lower() in ('true', '1', 'yes')
 
 ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '192.168.1.185']
 
+# settings.py
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 5000
 # ---------------------------------------------------------------------------
 # APPS
 # ---------------------------------------------------------------------------
@@ -48,6 +50,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.humanize',
 ]
 
 MIDDLEWARE = [
