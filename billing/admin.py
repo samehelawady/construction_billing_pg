@@ -8,6 +8,7 @@ from .models import (
     ExpenseCategory, SubExpense, Expense,
     Employee, EmployeeTransfer, PayrollRecord, PayrollCostCenter, PayrollAllocation,
     PricingProject, PricingBOQItem, VariationOrder,
+    Supplier, SupplierInvoice, SupplierPayment,
 )
 from django.urls import reverse
 from decimal import Decimal
@@ -297,6 +298,10 @@ class CompanyScopedAdminMixin:
                 kwargs['queryset'] = Invoice.objects.filter(
                     Q(project__company=company) | Q(project__company__isnull=True)
                 )
+            elif db_field.name == 'supplier':
+                kwargs['queryset'] = Supplier.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
     def formfield_for_manytomany(self, db_field, request, **kwargs):
@@ -464,6 +469,8 @@ class EnhancedAdminSite(AdminSite):
                 'name': 'Completed Projects', 'url': reverse('admin:billing_project_changelist') + '?completed=1',
                 'count': completed_projects, 'badge_color': 'success'
             },
+            {'name': 'Suppliers', 'url': reverse('admin:billing_supplier_changelist'), 'count': None},
+            {'name': 'Supplier Invoices', 'url': reverse('admin:billing_supplierinvoice_changelist'), 'count': None},
         ]
 
     def index(self, request, extra_context=None):
@@ -769,7 +776,8 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
         """
         company = self.get_active_company(request)
 
-        # Build report categories
+        # In ReportsDashboardAdmin.changelist_view(), replace the report_categories list with this:
+
         report_categories = [
             {
                 'name': 'Client Reports',
@@ -818,6 +826,21 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
                         'url': reverse('admin:retention_held_report'),
                         'icon': '🔒',
                         'badge': 'Retention',
+                    },
+                ]
+            },
+            {
+                'name': 'Cash Flow',
+                'icon': '💰',
+                'description': 'Cash flow predictions, supplier aging, and liquidity forecasting',
+                'color': '#1565c0',
+                'reports': [
+                    {
+                        'name': 'Cash Flow Prediction',
+                        'description': '13-week rolling cash flow with inflow from client invoices and outflow from supplier payments',
+                        'url': reverse('admin:cash_flow_report'),
+                        'icon': '📈',
+                        'badge': 'Forecast',
                     },
                 ]
             },
@@ -1563,6 +1586,570 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
             logo_url
         ))
 
+    def cash_flow_report(self, request):
+        """
+        Professional Cash Flow Prediction Report.
+
+        INFLOW: From approved/pending client tax invoices with estimated collection dates
+                based on invoice date + project payment terms.
+
+        OUTFLOW: From supplier invoices with expected_payment_date.
+        Includes: Supplier payments, payroll estimates, and other known outflows.
+
+        Shows 13-week rolling forecast with weekly buckets.
+        """
+        from datetime import datetime, timedelta
+        from collections import OrderedDict
+        from dateutil.relativedelta import relativedelta
+
+        company = self.get_active_company(request)
+        logo_url = company.logo.url if company and company.logo else ''
+        today = date.today()
+
+        # ─────────────────────────────────────────────────────────────
+        # CONFIGURATION
+        # ─────────────────────────────────────────────────────────────
+        WEEKS_AHEAD = 13  # 13-week rolling forecast
+        WEEK_START = today - timedelta(days=today.weekday())  # Monday of current week
+
+        # ─────────────────────────────────────────────────────────────
+        # BUILD WEEK BUCKETS
+        # ─────────────────────────────────────────────────────────────
+        weeks = []
+        for i in range(WEEKS_AHEAD):
+            week_start = WEEK_START + timedelta(weeks=i)
+            week_end = week_start + timedelta(days=6)
+            weeks.append({
+                'start': week_start,
+                'end': week_end,
+                'label': f"{week_start.strftime('%d %b')} — {week_end.strftime('%d %b')}",
+                'month_label': week_start.strftime('%b %Y'),
+            })
+
+        # ─────────────────────────────────────────────────────────────
+        # FETCH INFLOW DATA (Client Invoice Collections)
+        # ─────────────────────────────────────────────────────────────
+
+        # Approved tax invoices that are NOT paid yet - these are expected collections
+        client_invoices = Invoice.objects.filter(
+            inv_type='T',
+            status__in=['Approved', 'Draft']  # Approved = sent to client, Draft = being prepared
+        ).exclude(is_advance_invoice=True).select_related('project', 'project__client')
+
+        if company:
+            client_invoices = client_invoices.filter(project__company=company)
+
+        # For each invoice, estimate collection date = invoice date + project payment terms
+        inflow_items = []
+        for inv in client_invoices:
+            payment_terms = inv.project.payment_terms or 30
+            estimated_collection = inv.date + timedelta(days=payment_terms)
+
+            # Adjust for weekends (move to next Monday if falls on weekend)
+            while estimated_collection.weekday() >= 5:  # Saturday=5, Sunday=6
+                estimated_collection += timedelta(days=1)
+
+            # Probability factor based on status
+            probability = Decimal("0.9") if inv.status == 'Approved' else Decimal("0.6")
+
+            inflow_items.append({
+                'type': 'Client Invoice',
+                'description': str(inv),
+                'project': inv.project.project_name,
+                'client': inv.project.client.name,
+                'amount': inv.total_after_vat,  # Total including VAT - what client will pay
+                'net_amount': inv.current_certified_net_before_vat,
+                'estimated_date': estimated_collection,
+                'probability': probability,
+                'weighted_amount': inv.total_after_vat * probability,
+                'status': inv.status,
+                'confidence': 'High' if inv.status == 'Approved' else 'Medium',
+            })
+
+        # Also include PAID invoices with collection_date in the future (rare but possible)
+        paid_future = Invoice.objects.filter(
+            inv_type='T',
+            status='Paid',
+            collection_date__gt=today
+        ).exclude(is_advance_invoice=True).select_related('project', 'project__client')
+
+        if company:
+            paid_future = paid_future.filter(project__company=company)
+
+        for inv in paid_future:
+            inflow_items.append({
+                'type': 'Client Invoice (Confirmed)',
+                'description': str(inv),
+                'project': inv.project.project_name,
+                'client': inv.project.client.name,
+                'amount': inv.total_after_vat,
+                'net_amount': inv.current_certified_net_before_vat,
+                'estimated_date': inv.collection_date,
+                'probability': Decimal("1.0"),
+                'weighted_amount': inv.total_after_vat,
+                'status': 'Paid (Pending Collection)',
+                'confidence': 'Confirmed',
+            })
+
+        # ─────────────────────────────────────────────────────────────
+        # FETCH OUTFLOW DATA (Supplier Payments)
+        # ─────────────────────────────────────────────────────────────
+
+        supplier_invoices = SupplierInvoice.objects.filter(
+            status__in=['Draft', 'Approved', 'Scheduled']
+        ).exclude(status='Paid').exclude(status='Cancelled').select_related('supplier', 'project')
+
+        if company:
+            supplier_invoices = supplier_invoices.filter(company=company)
+
+        outflow_items = []
+        for inv in supplier_invoices:
+            pay_date = inv.expected_payment_date or inv.due_date
+
+            outflow_items.append({
+                'type': 'Supplier Payment',
+                'description': f"{inv.supplier.name} — {inv.supplier_inv_number}",
+                'supplier': inv.supplier.name,
+                'project': inv.project.project_name if inv.project else 'Overhead',
+                'amount': inv.balance_due,
+                'total_amount': inv.total_amount,
+                'expected_date': pay_date,
+                'status': inv.status,
+                'category': inv.supplier.category,
+                'is_recurring': inv.is_recurring,
+            })
+
+        # ─────────────────────────────────────────────────────────────
+        # FETCH PAYROLL OUTFLOW (Estimated)
+        # ─────────────────────────────────────────────────────────────
+
+        # Get active employees and estimate monthly payroll
+        emp_filter = {'is_active': True}
+        if company:
+            emp_filter['company'] = company
+
+        active_employees = Employee.objects.filter(**emp_filter)
+        monthly_payroll = Decimal("0")
+        for emp in active_employees:
+            monthly_payroll += emp.total_salary + emp.monthly_admin_cost
+
+        # Generate payroll outflow items for next 3 months
+        payroll_items = []
+        for i in range(3):
+            payroll_date = today.replace(day=1) + relativedelta(months=i)
+            # Payroll typically paid by end of month or early next month
+            pay_date = payroll_date + relativedelta(months=1, day=5)  # 5th of next month
+
+            payroll_items.append({
+                'type': 'Payroll',
+                'description': f"Monthly Payroll — {payroll_date.strftime('%b %Y')}",
+                'amount': monthly_payroll,
+                'expected_date': pay_date,
+                'status': 'Projected',
+                'category': 'Payroll',
+            })
+
+        # ─────────────────────────────────────────────────────────────
+        # AGGREGATE BY WEEK
+        # ─────────────────────────────────────────────────────────────
+
+        week_data = []
+        cumulative_inflow = Decimal("0")
+        cumulative_outflow = Decimal("0")
+
+        for week in weeks:
+            week_inflow = Decimal("0")
+            week_weighted_inflow = Decimal("0")
+            week_outflow = Decimal("0")
+            week_inflow_items = []
+            week_outflow_items = []
+
+            # Client inflows
+            for item in inflow_items:
+                if week['start'] <= item['estimated_date'] <= week['end']:
+                    week_inflow += item['amount']
+                    week_weighted_inflow += item['weighted_amount']
+                    week_inflow_items.append(item)
+
+            # Supplier outflows
+            for item in outflow_items:
+                if week['start'] <= item['expected_date'] <= week['end']:
+                    week_outflow += item['amount']
+                    week_outflow_items.append(item)
+
+            # Payroll outflows
+            for item in payroll_items:
+                if week['start'] <= item['expected_date'] <= week['end']:
+                    week_outflow += item['amount']
+                    week_outflow_items.append(item)
+
+            net_flow = week_inflow - week_outflow
+            cumulative_inflow += week_inflow
+            cumulative_outflow += week_outflow
+            running_balance = cumulative_inflow - cumulative_outflow
+
+            week_data.append({
+                'week': week,
+                'inflow': week_inflow,
+                'weighted_inflow': week_weighted_inflow,
+                'outflow': week_outflow,
+                'net_flow': net_flow,
+                'cumulative_inflow': cumulative_inflow,
+                'cumulative_outflow': cumulative_outflow,
+                'running_balance': running_balance,
+                'inflow_items': week_inflow_items,
+                'outflow_items': week_outflow_items,
+            })
+
+        # ─────────────────────────────────────────────────────────────
+        # SUMMARY METRICS
+        # ─────────────────────────────────────────────────────────────
+
+        total_inflow = sum(w['inflow'] for w in week_data)
+        total_weighted_inflow = sum(w['weighted_inflow'] for w in week_data)
+        total_outflow = sum(w['outflow'] for w in week_data)
+        net_position = total_inflow - total_outflow
+
+        # Current liquidity position (simplified)
+        opening_balance = Decimal("0")  # User should input this
+        closing_balance = opening_balance + net_position
+
+        # Risk assessment
+        risk_level = "Low"
+        risk_color = "#2e7d32"
+        if closing_balance < 0:
+            risk_level = "CRITICAL"
+            risk_color = "#c62828"
+        elif closing_balance < total_outflow * Decimal("0.2"):
+            risk_level = "High"
+            risk_color = "#d32f2f"
+        elif closing_balance < total_outflow * Decimal("0.5"):
+            risk_level = "Medium"
+            risk_color = "#f57c00"
+
+        # ─────────────────────────────────────────────────────────────
+        # BUILD WEEKLY TABLE ROWS
+        # ─────────────────────────────────────────────────────────────
+
+        week_rows = ""
+        for w in week_data:
+            net_color = "#2e7d32" if w['net_flow'] >= 0 else "#c62828"
+            balance_color = "#2e7d32" if w['running_balance'] >= 0 else "#c62828"
+
+            # Inflow detail tooltip
+            inflow_detail = "<br>".join([
+                f"• {item['client']}: AED {item['amount']:,.2f} ({item['confidence']})"
+                for item in w['inflow_items'][:3]
+            ])
+            if len(w['inflow_items']) > 3:
+                inflow_detail += f"<br>• ... and {len(w['inflow_items']) - 3} more"
+
+            # Outflow detail tooltip
+            outflow_detail = "<br>".join([
+                f"• {item['supplier'] if 'supplier' in item else item['description']}: AED {item['amount']:,.2f}"
+                for item in w['outflow_items'][:3]
+            ])
+            if len(w['outflow_items']) > 3:
+                outflow_detail += f"<br>• ... and {len(w['outflow_items']) - 3} more"
+
+            week_rows += f"""
+            <tr style="border-left: 4px solid {net_color};">
+                <td style="font-weight: bold; padding: 10px 8px;">{w['week']['label']}</td>
+                <td class="num" style="color: #2e7d32; font-weight: 600;">{w['inflow']:,.2f}</td>
+                <td class="num" style="color: #6a1b9a; font-size: 9px;">{w['weighted_inflow']:,.2f}</td>
+                <td class="num" style="color: #c62828; font-weight: 600;">{w['outflow']:,.2f}</td>
+                <td class="num" style="color: {net_color}; font-weight: bold; font-size: 11px;">{w['net_flow']:,.2f}</td>
+                <td class="num" style="color: {balance_color}; font-weight: bold;">{w['running_balance']:,.2f}</td>
+                <td style="font-size: 8px; color: #666; max-width: 150px;">{inflow_detail or '—'}</td>
+                <td style="font-size: 8px; color: #666; max-width: 150px;">{outflow_detail or '—'}</td>
+            </tr>
+            """
+
+        # ─────────────────────────────────────────────────────────────
+        # INFLOW DETAIL TABLE
+        # ─────────────────────────────────────────────────────────────
+
+        inflow_rows = ""
+        for item in sorted(inflow_items, key=lambda x: x['estimated_date']):
+            conf_color = "#2e7d32" if item['confidence'] == 'Confirmed' else "#f57c00" if item['confidence'] == 'High' else "#ed6c02"
+            inflow_rows += f"""
+            <tr>
+                <td class="center">{item['estimated_date'].strftime('%d-%b-%Y')}</td>
+                <td class="text"><b>{item['description']}</b></td>
+                <td class="text">{item['client']}</td>
+                <td class="text">{item['project']}</td>
+                <td class="num font-bold">{item['amount']:,.2f}</td>
+                <td class="num" style="color: #6a1b9a;">{item['weighted_amount']:,.2f}</td>
+                <td class="center"><span class="badge badge-success">{item['status']}</span></td>
+                <td class="center" style="color: {conf_color}; font-weight: bold;">{item['confidence']}</td>
+            </tr>
+            """
+
+        # ─────────────────────────────────────────────────────────────
+        # OUTFLOW DETAIL TABLE
+        # ─────────────────────────────────────────────────────────────
+
+        outflow_rows = ""
+        for item in sorted(outflow_items + payroll_items,
+                           key=lambda x: x.get('expected_date', x.get('estimated_date', today))):
+            pay_date = item.get('expected_date', item.get('estimated_date', today))
+            is_payroll = item['type'] == 'Payroll'
+            status_badge = '<span class="badge badge-primary">Scheduled</span>' if is_payroll else f'<span class="badge badge-warning">{item["status"]}</span>'
+
+            outflow_rows += f"""
+            <tr>
+                <td class="center">{pay_date.strftime('%d-%b-%Y')}</td>
+                <td class="text"><b>{item['description']}</b></td>
+                <td class="text">{item.get('supplier', item.get('category', 'N/A'))}</td>
+                <td class="text">{item.get('project', 'Overhead')}</td>
+                <td class="num font-bold text-danger">({item['amount']:,.2f})</td>
+                <td class="center">{status_badge}</td>
+                <td class="center">{'🔄' if item.get('is_recurring') else ''}</td>
+            </tr>
+            """
+
+        # ─────────────────────────────────────────────────────────────
+        # SUPPLIER SUMMARY CARDS
+        # ─────────────────────────────────────────────────────────────
+
+        supplier_summary = SupplierInvoice.objects.filter(
+            status__in=['Draft', 'Approved', 'Scheduled']
+        ).exclude(status='Paid').exclude(status='Cancelled')
+
+        if company:
+            supplier_summary = supplier_summary.filter(company=company)
+
+        supplier_totals = {}
+        for inv in supplier_summary.select_related('supplier'):
+            cat = inv.supplier.category
+            if cat not in supplier_totals:
+                supplier_totals[cat] = Decimal("0")
+            supplier_totals[cat] += inv.balance_due
+
+        supplier_cards = ""
+        cat_colors = {
+            'Material': '#1565c0',
+            'Subcontractor': '#6a1b9a',
+            'Equipment': '#ed6c02',
+            'Service': '#2e7d32',
+            'Utility': '#00897b',
+            'Other': '#757575',
+        }
+
+        for cat, total in sorted(supplier_totals.items(), key=lambda x: x[1], reverse=True):
+            color = cat_colors.get(cat, '#757575')
+            pct = (total / total_outflow * 100) if total_outflow > 0 else 0
+            supplier_cards += f"""
+            <div class="metric-card" style="border-left: 4px solid {color};">
+                <div class="metric-value" style="color: {color}; font-size: 18px;">AED {total:,.2f}</div>
+                <div class="metric-label">{cat}</div>
+                <div style="font-size: 8px; color: #666; margin-top: 4px;">{pct:.1f}% of total outflow</div>
+            </div>
+            """
+
+        # ─────────────────────────────────────────────────────────────
+        # BUILD FINAL HTML
+        # ─────────────────────────────────────────────────────────────
+
+        body = f"""
+        {self._build_meta_grid({
+            'Report Date': today.strftime('%d-%b-%Y'),
+            'Forecast Period': f"{weeks[0]['label']} to {weeks[-1]['label']}",
+            'Company': company.company_name if company else 'N/A',
+            'Risk Level': risk_level,
+        })}
+
+        <!-- Risk Alert Banner -->
+        <div style="background: {risk_color}; color: white; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.9; margin-bottom: 4px;">Cash Position Risk Assessment</div>
+            <div style="font-size: 22px; font-weight: 700;">{risk_level}</div>
+            <div style="font-size: 10px; opacity: 0.8; margin-top: 4px;">
+                Net Position: AED {net_position:,.2f} | 
+                Weighted Inflow: AED {total_weighted_inflow:,.2f}
+            </div>
+        </div>
+
+        <!-- Executive Summary Dashboard -->
+        <div class="card" style="background: linear-gradient(135deg, #1a237e 0%, #283593 100%); color: white; margin-bottom: 20px;">
+            <div class="card-header" style="color: white; border-color: rgba(255,255,255,0.3);">
+                <span class="icon">💰</span> CASH FLOW EXECUTIVE SUMMARY (13-Week Forecast)
+            </div>
+            <div class="grid-5">
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 22px;">AED {total_inflow:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">Total Expected Inflow</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.7); margin-top: 4px;">From {len(inflow_items)} client invoices</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 22px;">AED {total_weighted_inflow:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">Weighted Inflow (Risk-Adjusted)</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.7); margin-top: 4px;">Probability-adjusted</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 22px;">AED {total_outflow:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">Total Expected Outflow</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.7); margin-top: 4px;">Suppliers + Payroll</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: {'#2e7d32' if net_position >= 0 else '#ffcdd2'}; font-size: 22px;">AED {net_position:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">Net Cash Flow</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.7); margin-top: 4px;">Inflow minus Outflow</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 22px;">{len(inflow_items)} / {len(outflow_items) + len(payroll_items)}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">Inflow / Outflow Items</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.7); margin-top: 4px;">Client inv / Supplier inv</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Weekly Cash Flow Table -->
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-header">
+                <span class="icon">📅</span> WEEKLY CASH FLOW FORECAST
+            </div>
+            <table class="data-table" style="font-size: 9px;">
+                <thead>
+                    <tr>
+                        <th style="width: 14%;">Week</th>
+                        <th class="num" style="width: 12%;">Inflow</th>
+                        <th class="num" style="width: 12%;">Weighted Inflow</th>
+                        <th class="num" style="width: 12%;">Outflow</th>
+                        <th class="num" style="width: 12%;">Net Flow</th>
+                        <th class="num" style="width: 12%;">Running Balance</th>
+                        <th style="width: 13%;">Inflow Sources</th>
+                        <th style="width: 13%;">Outflow Sources</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {week_rows}
+                </tbody>
+                <tfoot>
+                    <tr class="grand-total">
+                        <td><b>TOTAL 13-WEEK</b></td>
+                        <td class="num"><b>{total_inflow:,.2f}</b></td>
+                        <td class="num"><b>{total_weighted_inflow:,.2f}</b></td>
+                        <td class="num"><b>{total_outflow:,.2f}</b></td>
+                        <td class="num"><b>{net_position:,.2f}</b></td>
+                        <td class="num">—</td>
+                        <td colspan="2"></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+
+        <!-- Supplier Category Breakdown -->
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-header" style="color: #c62828; border-color: #ffcdd2;">
+                <span class="icon">📦</span> OUTFLOW BY SUPPLIER CATEGORY
+            </div>
+            <div class="grid-3">
+                {supplier_cards if supplier_cards else '<div style="text-align:center; color:#999; padding:20px;">No supplier invoices pending</div>'}
+            </div>
+        </div>
+
+        <!-- Inflow Detail -->
+        <div style="font-size: 14px; font-weight: 700; color: #1a237e; margin: 25px 0 15px 0; padding-bottom: 8px; border-bottom: 3px solid #1a237e;">
+            EXPECTED CLIENT COLLECTIONS (INFLOW)
+        </div>
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-header" style="color: #2e7d32; border-color: #c8e6c9;">
+                <span class="icon">📥</span> CLIENT INVOICE COLLECTION SCHEDULE
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Est. Collection</th>
+                        <th>Invoice</th>
+                        <th>Client</th>
+                        <th>Project</th>
+                        <th class="num">Amount</th>
+                        <th class="num">Weighted</th>
+                        <th class="center">Status</th>
+                        <th class="center">Confidence</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {inflow_rows if inflow_rows else '<tr><td colspan="8" style="text-align:center; color:#999; padding:20px;">No pending client invoices</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Outflow Detail -->
+        <div style="font-size: 14px; font-weight: 700; color: #1a237e; margin: 25px 0 15px 0; padding-bottom: 8px; border-bottom: 3px solid #1a237e;">
+            PLANNED PAYMENTS (OUTFLOW)
+        </div>
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-header" style="color: #c62828; border-color: #ffcdd2;">
+                <span class="icon">📤</span> SUPPLIER & PAYROLL PAYMENT SCHEDULE
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Payment Date</th>
+                        <th>Description</th>
+                        <th>Supplier/Category</th>
+                        <th>Project</th>
+                        <th class="num">Amount</th>
+                        <th class="center">Status</th>
+                        <th class="center">Recurring</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {outflow_rows if outflow_rows else '<tr><td colspan="7" style="text-align:center; color:#999; padding:20px;">No pending payments</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Key Alerts -->
+        <div class="card" style="margin-bottom: 20px; background: #fff3e0; border: 2px solid #ed6c02;">
+            <div class="card-header" style="color: #e65100; border-color: #ffe0b2;">
+                <span class="icon">⚠️</span> CASH FLOW ALERTS & RECOMMENDATIONS
+            </div>
+            <div style="padding: 12px; font-size: 10px; line-height: 1.8;">
+                <ul style="margin: 0; padding-left: 16px;">
+                    <li><b>Inflow Concentration:</b> {len(inflow_items)} client invoices pending collection. 
+                        Weighted inflow is AED {total_weighted_inflow:,.2f} (risk-adjusted).</li>
+                    <li><b>Outflow Obligations:</b> {len(outflow_items)} supplier invoices + {len(payroll_items)} payroll periods = 
+                        AED {total_outflow:,.2f} total commitments.</li>
+                    <li><b>Collection Timing:</b> Inflows are estimated based on invoice date + payment terms. 
+                        Actual collection may vary based on client payment behavior.</li>
+                    <li><b>Recommendation:</b> {"URGENT: Negative cash position predicted. Consider accelerating collections or deferring non-critical payments." if net_position < 0 else "Cash position is positive. Monitor weekly to ensure sufficient liquidity for large outflows."}</li>
+                </ul>
+            </div>
+        </div>
+
+        <!-- Signatures -->
+        <div class="signature-grid" style="margin-top: 40px;">
+            <div class="signature-block">
+                <div style="font-size: 8px; color: #666; margin-top: 4px;">Finance Director</div>
+            </div>
+            <div class="signature-block">
+                <div style="font-size: 8px; color: #666; margin-top: 4px;">General Manager</div>
+            </div>
+            <div class="signature-block">
+                <div style="font-size: 8px; color: #666; margin-top: 4px;">Date</div>
+            </div>
+        </div>
+        """
+
+        # Add extra CSS for grid-5
+        extra_css = """
+        <style>
+            .grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; }
+            @media (max-width: 1200px) { .grid-5 { grid-template-columns: repeat(3, 1fr); } }
+            @media (max-width: 768px) { .grid-5 { grid-template-columns: repeat(2, 1fr); } }
+        </style>
+        """
+
+        return HttpResponse(self._report_base_wrapper(
+            "CASH FLOW PREDICTION REPORT",
+            f"13-Week Rolling Forecast — {today.strftime('%d %B %Y')}",
+            body,
+            logo_url,
+            extra_css
+        ))
+
     def get_urls(self):
         urls = super().get_urls()
         # These URLs serve as entry points that redirect to actual report lists
@@ -1596,6 +2183,7 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
                  name='materials_supplied_report'),
             path('retention-held/', self.admin_site.admin_view(self.retention_held_report),
                  name='retention_held_report'),
+            path('cash-flow/', self.admin_site.admin_view(self.cash_flow_report), name='cash_flow_report'),
         ]
         return custom + urls
 
@@ -2742,7 +3330,6 @@ class BOQItemAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         if not project_id:
             return JsonResponse([], safe=False)
 
-        # FIX: Apply company scoping
         company = self.get_active_company(request)
         qs = BOQItem.objects.filter(project_id=project_id)
         if company:
@@ -5427,7 +6014,9 @@ class SubExpenseInline(admin.TabularInline):
 @admin.register(ExpenseCategory)
 class ExpenseCategoryAdmin(CompanyScopedAdminMixin,admin.ModelAdmin):
     company_field_path = 'company'
-    list_display = ["name", "sub_expense_count"]
+    list_display = ["name", "sub_expense_count", "default_supplier", "company"]
+    list_filter = ["company", "default_supplier"]
+    autocomplete_fields = ["default_supplier"]
     inlines = [SubExpenseInline]
     search_fields = ["name"]
 
@@ -5456,13 +6045,63 @@ class ExpenseCategoryAdmin(CompanyScopedAdminMixin,admin.ModelAdmin):
 @admin.register(Expense)
 class ExpenseAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     company_field_path = 'project__company'
-    list_display = ["date", "project", "category", "sub_category", "fmt_amount", "boq_item", "is_allocated"]
-    list_filter = ["project__company", "project", "category", "date", "is_allocated"]
-    search_fields = ["description", "reference_number"]
-    autocomplete_fields = ["project"]
+    list_display = [
+        "date", "project", "category", "sub_category",
+        "fmt_supplier", "fmt_amount", "boq_item",
+        "is_allocated", "is_auto_generated"
+    ]
+    list_filter = [
+        "project__company", "project", "category", "supplier",
+        "date", "is_allocated", "is_auto_generated"
+    ]
+    search_fields = ["description", "reference_number", "supplier__name"]
+    autocomplete_fields = ["project", "boq_item", "supplier", "supplier_invoice"]
+    readonly_fields = ["is_auto_generated", "supplier_invoice_link"]
+
+    fieldsets = (
+        ("Expense Details", {
+            "fields": (
+                ("project", "date"),
+                ("category", "sub_category"),
+                ("boq_item",),
+                ("amount",),
+                ("description", "reference_number"),
+                ("is_allocated",),
+            )
+        }),
+        ("Supplier Linkage", {
+            "fields": (
+                ("supplier", "supplier_invoice"),
+                ("supplier_invoice_link",),
+                ("is_auto_generated",),
+            ),
+            "description": "Link to supplier invoice (auto-populated when created from AP)",
+            "classes": ("collapse",)
+        }),
+    )
 
     class Media:
         js = ('admin/js/vendor/jquery/jquery.min.js', 'admin/js/jquery.init.js', 'admin/js/expense_boq_filter.js')
+
+    def fmt_supplier(self, obj):
+        if obj.supplier:
+            return mark_safe(
+                f'<div style="font-size:10px;"><b>{obj.supplier.name}</b></div>'
+            )
+        return mark_safe('<span style="color:#999;">—</span>')
+    fmt_supplier.short_description = "Supplier"
+
+    def supplier_invoice_link(self, obj):
+        """Display a clickable link to the linked supplier invoice."""
+        if obj.supplier_invoice:
+            url = reverse('admin:billing_supplierinvoice_change', args=[obj.supplier_invoice.pk])
+            return mark_safe(
+                f'<a href="{url}" target="_blank" style="color:#1a237e; font-weight:bold;">'
+                f'📄 {obj.supplier_invoice.supplier_inv_number} (AED {obj.supplier_invoice.total_amount:,.2f})'
+                f'</a>'
+            )
+        return mark_safe('<span style="color:#999;">No linked invoice</span>')
+    supplier_invoice_link.short_description = "Linked Supplier Invoice"
 
     def fmt_amount(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.amount:,.2f}</div>')
@@ -5500,6 +6139,16 @@ class ExpenseAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                     kwargs["queryset"] = SubExpense.objects.none()
             else:
                 kwargs["queryset"] = SubExpense.objects.none()
+        elif db_field.name == "supplier":
+            if company:
+                kwargs["queryset"] = Supplier.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+        elif db_field.name == "supplier_invoice":
+            if company:
+                kwargs["queryset"] = SupplierInvoice.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
         else:
             return super().formfield_for_foreignkey(db_field, request, **kwargs)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
@@ -6721,6 +7370,564 @@ class PricingBOQItemInline(admin.TabularInline):
             kwargs['queryset'] = BOQItem.objects.filter(project__company=company)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
+
+
+# =============================================================================
+# SUPPLIER ADMIN
+# =============================================================================
+
+@admin.register(Supplier)
+class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'company'
+    list_display = [
+        "name", "category", "contact_person", "payment_terms",
+        "fmt_total_payable", "fmt_credit_limit", "is_active", "aging_button"
+    ]
+    list_filter = ["company", "category", "is_active", "payment_terms"]
+    search_fields = ["name", "contact_person", "trn_number", "email"]
+    fieldsets = (
+        ("Basic Information", {
+            "fields": ("company", "name", "category", "contact_person", "is_active")
+        }),
+        ("Contact Details", {
+            "fields": ("phone", "email", "address", "trn_number")
+        }),
+        ("Payment Terms", {
+            "fields": ("payment_terms", "credit_limit")
+        }),
+        ("Banking Details", {
+            "fields": ("bank_name", "account_name", "account_number", "iban", "swift_code"),
+            "classes": ("collapse",)
+        }),
+        ("Notes", {
+            "fields": ("notes",),
+            "classes": ("collapse",)
+        }),
+        ("Linked Expense", {
+            "fields": ("linked_expense_display",),
+            "description": "Auto-generated expense record linked to this invoice",
+            "classes": ("collapse",)
+        }),
+    )
+
+    def fmt_total_payable(self, obj):
+        total = obj.total_payable
+        if total > 0:
+            return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#c62828;">{total:,.2f}</div>')
+        return mark_safe('<span style="color:#999;">—</span>')
+    fmt_total_payable.short_description = "Total Payable"
+
+    def fmt_credit_limit(self, obj):
+        if obj.credit_limit > 0:
+            usage = (obj.total_payable / obj.credit_limit * 100) if obj.credit_limit > 0 else 0
+            color = "#d32f2f" if usage > 90 else "#ed6c02" if usage > 70 else "#2e7d32"
+            return mark_safe(
+                f'<div style="text-align:right;font-weight:bold;color:{color};">'
+                f'{obj.credit_limit:,.2f}</div>'
+                f'<div style="font-size:8px;color:#666;">{usage:.0f}% used</div>'
+            )
+        return mark_safe('<span style="color:#999;">—</span>')
+    fmt_credit_limit.short_description = "Credit Limit"
+
+    def aging_button(self, obj):
+        url = reverse('admin:supplier_aging', args=[obj.pk])
+        return format_html(
+            '<a class="button" href="{}" target="_blank" style="background:#1a237e; color:white; padding:2px 8px; '
+            'border-radius:4px; font-size:10px; text-decoration:none; font-weight:600;">📊 Aging</a>',
+            url
+        )
+    aging_button.short_description = "Report"
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom = [
+            path('<int:pk>/aging/', self.admin_site.admin_view(self.aging_view), name='supplier_aging'),
+        ]
+        return custom + urls
+
+    def aging_view(self, request, pk):
+        """Supplier Aging Report"""
+        company = self.get_active_company(request)
+        supplier = self.get_object_or_404_scoped(request, Supplier, pk=pk)
+        logo_url = company.logo.url if company and company.logo else ''
+
+        invoices = SupplierInvoice.objects.filter(
+            supplier=supplier
+        ).exclude(status='Paid').exclude(status='Cancelled')
+
+        if company:
+            invoices = invoices.filter(company=company)
+
+        # Bucket the invoices
+        buckets = {
+            'Current': [],
+            '1-30 Days': [],
+            '31-60 Days': [],
+            '61-90 Days': [],
+            '90+ Days': [],
+        }
+        bucket_totals = {k: Decimal("0") for k in buckets.keys()}
+
+        for inv in invoices:
+            bucket = inv.aging_bucket
+            if bucket in buckets:
+                buckets[bucket].append(inv)
+                bucket_totals[bucket] += inv.balance_due
+
+        # Build bucket sections
+        bucket_html = ""
+        colors = {
+            'Current': ('#2e7d32', '#e8f5e9'),
+            '1-30 Days': ('#f57c00', '#fff3e0'),
+            '31-60 Days': ('#ed6c02', '#ffe0b2'),
+            '61-90 Days': ('#d32f2f', '#ffcdd2'),
+            '90+ Days': ('#c62828', '#ffebee'),
+        }
+
+        for bucket_name, inv_list in buckets.items():
+            if not inv_list:
+                continue
+            color, bg = colors[bucket_name]
+            rows = ""
+            for inv in inv_list:
+                rows += f"""
+                <tr>
+                    <td class="center">{inv.supplier_inv_number}</td>
+                    <td class="center">{inv.invoice_date.strftime('%d-%b-%Y')}</td>
+                    <td class="center">{inv.due_date.strftime('%d-%b-%Y')}</td>
+                    <td class="text">{inv.description[:60]}</td>
+                    <td class="num">{inv.total_amount:,.2f}</td>
+                    <td class="num text-success">{inv.paid_amount:,.2f}</td>
+                    <td class="num font-bold text-danger">{inv.balance_due:,.2f}</td>
+                    <td class="center"><span class="badge badge-warning">{inv.days_overdue} days</span></td>
+                </tr>
+                """
+
+            bucket_html += f"""
+            <div class="card" style="margin-bottom: 16px; border-left: 4px solid {color};">
+                <div class="card-header" style="color: {color}; border-color: {color};">
+                    <span class="icon">⏱️</span> {bucket_name} 
+                    <span class="badge badge-danger" style="margin-left: 10px;">{len(inv_list)} invoices</span>
+                    <span style="float: right; color: {color}; font-weight: bold;">AED {bucket_totals[bucket_name]:,.2f}</span>
+                </div>
+                <table class="data-table" style="margin: 0;">
+                    <thead>
+                        <tr>
+                            <th>Inv #</th>
+                            <th>Inv Date</th>
+                            <th>Due Date</th>
+                            <th>Description</th>
+                            <th class="num">Total</th>
+                            <th class="num">Paid</th>
+                            <th class="num">Balance</th>
+                            <th>Overdue</th>
+                        </tr>
+                    </thead>
+                    <tbody>{rows}</tbody>
+                    <tfoot>
+                        <tr style="background: {bg}; font-weight: bold;">
+                            <td colspan="4"><b>{bucket_name} TOTAL</b></td>
+                            <td class="num">—</td>
+                            <td class="num">—</td>
+                            <td class="num text-danger"><b>{bucket_totals[bucket_name]:,.2f}</b></td>
+                            <td></td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+            """
+
+        grand_total = sum(bucket_totals.values())
+
+        body = f"""
+        {self._build_meta_grid({
+            'Supplier': supplier.name,
+            'Category': supplier.get_category_display(),
+            'TRN': supplier.trn_number or 'N/A',
+            'Payment Terms': f"{supplier.payment_terms} days",
+            'Credit Limit': f"AED {supplier.credit_limit:,.2f}" if supplier.credit_limit > 0 else 'N/A',
+            'Report Date': date.today().strftime('%d-%b-%Y'),
+        })}
+
+        <div class="card" style="background: linear-gradient(135deg, #1a237e 0%, #283593 100%); color: white; margin-bottom: 20px;">
+            <div class="card-header" style="color: white; border-color: rgba(255,255,255,0.3);">
+                <span class="icon">📊</span> SUPPLIER AGING SUMMARY
+            </div>
+            <div class="grid-5">
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['Current']:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">Current</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['1-30 Days']:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">1-30 Days</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['31-60 Days']:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">31-60 Days</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['61-90 Days']:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">61-90 Days</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
+                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['90+ Days']:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.9);">90+ Days</div>
+                </div>
+            </div>
+            <div style="text-align: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.2);">
+                <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8;">TOTAL OUTSTANDING</div>
+                <div style="font-size: 28px; font-weight: 700;">AED {grand_total:,.2f}</div>
+            </div>
+        </div>
+
+        {bucket_html if bucket_html else '<div class="card" style="text-align:center; padding:40px; color:#666;"><p>No outstanding invoices for this supplier.</p></div>'}
+
+        <div class="signature-grid" style="margin-top: 40px;">
+            <div class="signature-block">
+                <div style="font-size: 8px; color: #666; margin-top: 4px;">Finance Director</div>
+            </div>
+            <div class="signature-block">
+                <div style="font-size: 8px; color: #666; margin-top: 4px;">Procurement Manager</div>
+            </div>
+            <div class="signature-block">
+                <div style="font-size: 8px; color: #666; margin-top: 4px;">General Manager</div>
+            </div>
+        </div>
+        """
+
+        return HttpResponse(self._report_base_wrapper(
+            "SUPPLIER AGING REPORT",
+            f"Accounts Payable Aging — {supplier.name}",
+            body,
+            logo_url
+        ))
+
+
+# =============================================================================
+# SUPPLIER INVOICE (AP) ADMIN
+# =============================================================================
+
+class SupplierPaymentInline(admin.TabularInline):
+    model = SupplierPayment
+    extra = 0
+    fields = ["payment_date", "amount", "payment_method", "bank_reference", "reference_number"]
+
+
+@admin.register(SupplierInvoice)
+class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'company'
+    inlines = [SupplierPaymentInline]
+    list_display = [
+        "supplier_inv_number", "supplier", "project", "fmt_amount",
+        "fmt_total", "fmt_balance", "status_badge", "due_date",
+        "days_overdue_display", "expected_payment_date", "is_recurring",
+        "linked_expense_count",
+    ]
+
+    list_filter = [
+        "company", "status", "supplier__category", "is_recurring", "recurring_frequency",
+        "invoice_date", "due_date", "supplier"
+    ]
+    search_fields = ["supplier_inv_number", "description", "supplier__name", "reference_number"]
+    date_hierarchy = "due_date"
+    autocomplete_fields = ["supplier", "project", "expense_category"]
+
+    fieldsets = (
+        ("Invoice Details", {
+            "fields": (
+                ("company", "supplier"),
+                ("supplier_inv_number", "reference_number"),
+                "description",
+                ("project", "boq_item", "expense_category"),
+            )
+        }),
+        ("Amounts", {
+            "fields": (
+                ("amount", "vat_percent"),
+                ("retention_percent",),
+            )
+        }),
+        ("Dates & Status", {
+            "fields": (
+                ("invoice_date", "due_date", "expected_payment_date"),
+                "status",
+            )
+        }),
+        ("Recurring", {
+            "fields": ("is_recurring", "recurring_frequency", "parent_invoice"),
+            "classes": ("collapse",)
+        }),
+        ("Payment Tracking", {
+            "fields": (
+                ("paid_amount", "actual_payment_date"),
+            ),
+            "classes": ("collapse",)
+        }),
+        ("Notes", {
+            "fields": ("notes",),
+            "classes": ("collapse",)
+        }),
+    )
+
+    class Media:
+        js = (
+            'admin/js/vendor/jquery/jquery.min.js',
+            'admin/js/jquery.init.js',
+            'billing/js/supplier_invoice_boq_filter.js',
+        )
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        company = self.get_active_company(request)
+
+        if db_field.name == 'boq_item':
+            # Get project from existing object
+            project_id = None
+            if hasattr(request, '_supplier_invoice_project_id'):
+                project_id = request._supplier_invoice_project_id
+            elif request.resolver_match and hasattr(request.resolver_match, 'kwargs'):
+                object_id = request.resolver_match.kwargs.get('object_id')
+                if object_id:
+                    try:
+                        obj = SupplierInvoice.objects.get(pk=object_id)
+                        project_id = obj.project_id
+                    except SupplierInvoice.DoesNotExist:
+                        pass
+
+            # Also check POST data
+            if not project_id and request.method == 'POST':
+                project_id = request.POST.get('project')
+
+            if project_id:
+                kwargs['queryset'] = BOQItem.objects.filter(project_id=project_id)
+            else:
+                kwargs['queryset'] = BOQItem.objects.none()
+
+        elif db_field.name == 'project':
+            if company:
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+        elif db_field.name == 'expense_category':
+            if company:
+                kwargs['queryset'] = ExpenseCategory.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+        elif db_field.name == 'supplier':
+            if company:
+                kwargs['queryset'] = Supplier.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if obj and obj.project_id:
+            request._supplier_invoice_project_id = obj.project_id
+        return form
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == 'boq_item':
+            # Try to get project from request (either POST data or existing object)
+            project_id = None
+
+            # Check if we're editing an existing object
+            if request.resolver_match and hasattr(request.resolver_match, 'kwargs'):
+                object_id = request.resolver_match.kwargs.get('object_id')
+                if object_id:
+                    try:
+                        obj = SupplierInvoice.objects.get(pk=object_id)
+                        if obj.project:
+                            kwargs['queryset'] = BOQItem.objects.filter(project=obj.project)
+                        else:
+                            kwargs['queryset'] = BOQItem.objects.none()
+                    except SupplierInvoice.DoesNotExist:
+                        kwargs['queryset'] = BOQItem.objects.none()
+                else:
+                    # Adding new — can't know project yet, return empty or all
+                    kwargs['queryset'] = BOQItem.objects.none()
+            else:
+                kwargs['queryset'] = BOQItem.objects.none()
+
+        elif db_field.name == 'project':
+            # Keep your existing company scoping for project
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        elif db_field.name == 'expense_category':
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = ExpenseCategory.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        elif db_field.name == 'supplier':
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = Supplier.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def linked_expense_display(self, obj):
+        """Display linked expenses with clickable links."""
+        expenses = obj.linked_expenses.all()
+        if not expenses.exists():
+            return mark_safe(
+                '<span style="color:#999;">No linked expenses yet. Save the invoice to auto-generate.</span>')
+
+        html = '<div style="display:flex; flex-direction:column; gap:4px;">'
+        for exp in expenses:
+            url = reverse('admin:billing_expense_change', args=[exp.pk])
+            badge = '<span style="background:#e8f5e9; color:#2e7d32; padding:1px 4px; border-radius:3px; font-size:8px;">Auto</span>' if exp.is_auto_generated else ''
+            html += (
+                f'<div style="display:flex; justify-content:space-between; align-items:center; padding:4px 8px; '
+                f'background:#f5f5f5; border-radius:4px;">'
+                f'<a href="{url}" target="_blank" style="color:#1a237e; font-weight:bold; text-decoration:none;">'
+                f'{exp.category.name} — AED {exp.amount:,.2f}</a>'
+                f'<span>{badge}</span>'
+                f'</div>'
+            )
+        html += '</div>'
+        return mark_safe(html)
+
+    linked_expense_display.short_description = "Linked Expenses"
+
+    def linked_expense_count(self, obj):
+        count = obj.linked_expenses.count()
+        if count > 0:
+            return mark_safe(f'<span style="color:#2e7d32; font-weight:bold;">{count}</span>')
+        return mark_safe('<span style="color:#999;">—</span>')
+
+    linked_expense_count.short_description = "Expenses"
+
+    def fmt_amount(self, obj):
+        return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.amount:,.2f}</div>')
+    fmt_amount.short_description = "Net Amount"
+
+    def fmt_total(self, obj):
+        return mark_safe(f'<div style="text-align:right;">{obj.total_amount:,.2f}</div>')
+    fmt_total.short_description = "Total + VAT"
+
+    def fmt_balance(self, obj):
+        balance = obj.balance_due
+        if balance > 0:
+            return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#c62828;">{balance:,.2f}</div>')
+        return mark_safe('<span style="color:#2e7d32; font-weight:bold;">PAID</span>')
+    fmt_balance.short_description = "Balance Due"
+
+    def status_badge(self, obj):
+        colors = {
+            'Draft': 'badge-warning',
+            'Approved': 'badge-info',
+            'Scheduled': 'badge-primary',
+            'Paid': 'badge-success',
+            'Cancelled': 'badge-danger',
+            'Disputed': 'badge-danger',
+        }
+        badge_class = colors.get(obj.status, 'badge-warning')
+        return mark_safe(f'<span class="badge {badge_class}">{obj.status}</span>')
+    status_badge.short_description = "Status"
+
+    def days_overdue_display(self, obj):
+        days = obj.days_overdue
+        if obj.status == 'Paid':
+            return mark_safe('<span style="color:#2e7d32; font-size:10px;">✓ Paid</span>')
+        if days == 0:
+            return mark_safe(f'<span style="color:#2e7d32; font-size:10px;">{days} days</span>')
+        elif days <= 30:
+            return mark_safe(f'<span style="color:#f57c00; font-size:10px; font-weight:bold;">{days} days</span>')
+        else:
+            return mark_safe(f'<span style="color:#c62828; font-size:10px; font-weight:bold;">{days} days ⚠️</span>')
+    days_overdue_display.short_description = "Overdue"
+
+    actions = ["mark_approved", "mark_scheduled", "mark_paid", "generate_next_recurring"]
+
+    @admin.action(description="Mark selected as Approved")
+    def mark_approved(self, request, queryset):
+        queryset.update(status='Approved')
+        self.message_user(request, f"{queryset.count()} invoice(s) marked as Approved.")
+
+    @admin.action(description="Mark selected as Scheduled for Payment")
+    def mark_scheduled(self, request, queryset):
+        queryset.update(status='Scheduled')
+        self.message_user(request, f"{queryset.count()} invoice(s) marked as Scheduled.")
+
+    @admin.action(description="Mark selected as Paid (full amount)")
+    def mark_paid(self, request, queryset):
+        today = date.today()
+        for inv in queryset:
+            if inv.status != 'Paid':
+                inv.paid_amount = inv.total_amount
+                inv.status = 'Paid'
+                inv.actual_payment_date = today
+                inv.save()
+        self.message_user(request, f"{queryset.count()} invoice(s) marked as Paid.")
+
+    @admin.action(description="Generate next recurring invoice")
+    def generate_next_recurring(self, request, queryset):
+        created = 0
+        for inv in queryset.filter(is_recurring=True):
+            # Calculate next date based on frequency
+            if inv.recurring_frequency == 'Monthly':
+                from dateutil.relativedelta import relativedelta
+                next_date = inv.invoice_date + relativedelta(months=1)
+                next_due = inv.due_date + relativedelta(months=1)
+            elif inv.recurring_frequency == 'Quarterly':
+                from dateutil.relativedelta import relativedelta
+                next_date = inv.invoice_date + relativedelta(months=3)
+                next_due = inv.due_date + relativedelta(months=3)
+            elif inv.recurring_frequency == 'Annual':
+                from dateutil.relativedelta import relativedelta
+                next_date = inv.invoice_date + relativedelta(years=1)
+                next_due = inv.due_date + relativedelta(years=1)
+            else:
+                continue
+
+            # Check if next instance already exists
+            if not SupplierInvoice.objects.filter(
+                parent_invoice=inv, invoice_date=next_date
+            ).exists():
+                SupplierInvoice.objects.create(
+                    company=inv.company,
+                    supplier=inv.supplier,
+                    project=inv.project,
+                    expense_category=inv.expense_category,
+                    supplier_inv_number=f"{inv.supplier_inv_number}-R",
+                    description=inv.description,
+                    amount=inv.amount,
+                    vat_percent=inv.vat_percent,
+                    invoice_date=next_date,
+                    due_date=next_due,
+                    expected_payment_date=next_due,
+                    status='Draft',
+                    is_recurring=True,
+                    recurring_frequency=inv.recurring_frequency,
+                    parent_invoice=inv,
+                    notes=f"Auto-generated recurring invoice from {inv.supplier_inv_number}"
+                )
+                created += 1
+
+        self.message_user(request, f"{created} recurring invoice(s) created.")
+
+
+@admin.register(SupplierPayment)
+class SupplierPaymentAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'supplier_invoice__company'
+    list_display = ["supplier_invoice", "payment_date", "fmt_amount", "payment_method", "bank_reference"]
+    list_filter = ["payment_method", "payment_date"]
+    search_fields = ["supplier_invoice__supplier__name", "bank_reference", "reference_number"]
+    date_hierarchy = "payment_date"
+    autocomplete_fields = ["supplier_invoice"]
+
+    def fmt_amount(self, obj):
+        return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#2e7d32;">{obj.amount:,.2f}</div>')
+    fmt_amount.short_description = "Amount"
 
 @admin.register(PricingProject)
 class PricingProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):

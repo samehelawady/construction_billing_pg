@@ -13,6 +13,10 @@ from datetime import date, timedelta
 import calendar
 from django.utils import timezone
 from .utils import money
+from django.db import migrations, models
+import django.db.models.deletion
+from decimal import Decimal
+from django.db.models import F, Sum
 
 
 # =============================================================================
@@ -728,6 +732,12 @@ class ExpenseCategory(models.Model):
     name = models.CharField(max_length=255)  # Remove unique=True — should be unique per company, not globally
     description = models.TextField(blank=True, null=True)
 
+    default_supplier = models.ForeignKey(
+        'Supplier', on_delete=models.SET_NULL,
+        related_name='default_expense_categories',
+        null=True, blank=True,
+        help_text="Default supplier for expenses in this category"
+    )
     class Meta:
         verbose_name = "Expense Category"
         verbose_name_plural = "Expense Categories"
@@ -772,13 +782,29 @@ class Expense(models.Model):
     reference_number = models.CharField(max_length=100, blank=True, null=True)
     is_allocated = models.BooleanField(default=False, help_text="True when cost is absorbed into BOQ items")
 
+    supplier = models.ForeignKey(
+        'Supplier', on_delete=models.SET_NULL,
+        related_name='expenses', null=True, blank=True,
+        help_text="Supplier who provided this good/service"
+    )
+    supplier_invoice = models.ForeignKey(
+        'SupplierInvoice', on_delete=models.SET_NULL,
+        related_name='linked_expenses', null=True, blank=True,
+        help_text="Linked supplier invoice (AP) that generated this expense"
+    )
+    is_auto_generated = models.BooleanField(
+        default=False,
+        help_text="True if this expense was auto-created from a supplier invoice"
+    )
+
     class Meta:
         verbose_name = "Expense"
         verbose_name_plural = "Expenses"
         ordering = ['-date']
 
     def __str__(self):
-        return f"{self.category.name} — {self.project.project_id_code} — {self.amount:,.2f}"
+        supplier_str = f" [{self.supplier.name}]" if self.supplier else ""
+        return f"{self.category.name}{supplier_str} — {self.project.project_id_code} — {self.amount:,.2f}"
 
 
 # =============================================================================
@@ -1277,3 +1303,494 @@ class PricingBOQItem(models.Model):
                 self.historical_cost = money((payroll_total + expense_total) / qty)
         self.proposed_total = money(self.estimated_quantity * self.proposed_rate)
         super().save(*args, **kwargs)
+
+# Generated migration for Supplier, SupplierInvoice, SupplierPayment models
+
+
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('billing', '00XX_previous_migration'),  # UPDATE THIS
+    ]
+
+    operations = [
+        migrations.CreateModel(
+            name='Supplier',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('name', models.CharField(max_length=255)),
+                ('contact_person', models.CharField(blank=True, max_length=255, null=True)),
+                ('phone', models.CharField(blank=True, max_length=100, null=True)),
+                ('email', models.EmailField(blank=True, max_length=254, null=True)),
+                ('address', models.TextField(blank=True, null=True)),
+                ('trn_number', models.CharField(blank=True, max_length=100, null=True, verbose_name='TRN / Tax ID')),
+                ('category', models.CharField(choices=[('Material', 'Material Supplier'), ('Subcontractor', 'Subcontractor'), ('Equipment', 'Equipment Rental'), ('Service', 'Professional Service'), ('Utility', 'Utility / Overhead'), ('Other', 'Other')], default='Material', max_length=20)),
+                ('payment_terms', models.IntegerField(default=30, help_text='Payment terms in days')),
+                ('credit_limit', models.DecimalField(decimal_places=2, default=Decimal('0'), help_text='Maximum credit limit from this supplier', max_digits=15)),
+                ('bank_name', models.CharField(blank=True, max_length=255, null=True)),
+                ('account_name', models.CharField(blank=True, max_length=255, null=True)),
+                ('account_number', models.CharField(blank=True, max_length=100, null=True)),
+                ('iban', models.CharField(blank=True, max_length=100, null=True)),
+                ('swift_code', models.CharField(blank=True, max_length=20, null=True)),
+                ('is_active', models.BooleanField(default=True)),
+                ('notes', models.TextField(blank=True, null=True)),
+                ('created_at', models.DateTimeField(auto_now_add=True)),
+                ('updated_at', models.DateTimeField(auto_now=True)),
+                ('company', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.CASCADE, related_name='suppliers', to='billing.companyprofile')),
+            ],
+            options={
+                'verbose_name': 'Supplier',
+                'verbose_name_plural': 'Suppliers',
+                'ordering': ['name'],
+            },
+        ),
+        migrations.CreateModel(
+            name='SupplierInvoice',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('supplier_inv_number', models.CharField(max_length=100, verbose_name='Supplier Invoice #')),
+                ('description', models.TextField()),
+                ('reference_number', models.CharField(blank=True, max_length=100, null=True)),
+                ('amount', models.DecimalField(decimal_places=2, default=Decimal('0'), help_text='Net amount before VAT', max_digits=15)),
+                ('vat_percent', models.DecimalField(decimal_places=2, default=Decimal('5'), max_digits=5)),
+                ('vat_amount', models.DecimalField(decimal_places=2, default=Decimal('0'), editable=False, max_digits=15)),
+                ('total_amount', models.DecimalField(decimal_places=2, default=Decimal('0'), editable=False, max_digits=15)),
+                ('retention_percent', models.DecimalField(decimal_places=2, default=Decimal('0'), max_digits=5)),
+                ('retention_amount', models.DecimalField(decimal_places=2, default=Decimal('0'), editable=False, max_digits=15)),
+                ('invoice_date', models.DateField()),
+                ('due_date', models.DateField()),
+                ('expected_payment_date', models.DateField(blank=True, help_text='When you plan to pay this invoice (may differ from due date)', null=True)),
+                ('status', models.CharField(choices=[('Draft', 'Draft'), ('Approved', 'Approved'), ('Scheduled', 'Scheduled for Payment'), ('Paid', 'Paid'), ('Cancelled', 'Cancelled'), ('Disputed', 'Disputed')], default='Draft', max_length=20)),
+                ('actual_payment_date', models.DateField(blank=True, null=True)),
+                ('paid_amount', models.DecimalField(decimal_places=2, default=Decimal('0'), max_digits=15)),
+                ('is_recurring', models.BooleanField(default=False)),
+                ('recurring_frequency', models.CharField(blank=True, choices=[('', 'One-time'), ('Monthly', 'Monthly'), ('Quarterly', 'Quarterly'), ('Annual', 'Annual')], default='', max_length=10)),
+                ('notes', models.TextField(blank=True, null=True)),
+                ('created_at', models.DateTimeField(auto_now_add=True)),
+                ('updated_at', models.DateTimeField(auto_now=True)),
+                ('boq_item', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='supplier_invoices', to='billing.boqitem')),
+                ('company', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.CASCADE, related_name='supplier_invoices', to='billing.companyprofile')),
+                ('expense_category', models.ForeignKey(blank=True, null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='supplier_invoices', to='billing.expensecategory')),
+                ('parent_invoice', models.ForeignKey(blank=True, help_text='Original invoice if this is a recurring instance', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='recurring_instances', to='billing.supplierinvoice')),
+                ('project', models.ForeignKey(blank=True, help_text='Which project this supplier cost relates to (optional)', null=True, on_delete=django.db.models.deletion.SET_NULL, related_name='supplier_invoices', to='billing.project')),
+                ('supplier', models.ForeignKey(on_delete=django.db.models.deletion.PROTECT, related_name='invoices', to='billing.supplier')),
+            ],
+            options={
+                'verbose_name': 'Supplier Invoice (AP)',
+                'verbose_name_plural': 'Supplier Invoices (AP)',
+                'ordering': ['-invoice_date', '-id'],
+            },
+        ),
+        migrations.CreateModel(
+            name='SupplierPayment',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('payment_date', models.DateField()),
+                ('amount', models.DecimalField(decimal_places=2, default=Decimal('0'), max_digits=15)),
+                ('payment_method', models.CharField(choices=[('Bank', 'Bank Transfer'), ('Cash', 'Cash'), ('Check', 'Check'), ('Card', 'Credit Card')], default='Bank', max_length=10)),
+                ('bank_reference', models.CharField(blank=True, max_length=100, null=True)),
+                ('reference_number', models.CharField(blank=True, max_length=100, null=True)),
+                ('notes', models.TextField(blank=True, null=True)),
+                ('created_at', models.DateTimeField(auto_now_add=True)),
+                ('supplier_invoice', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='payments', to='billing.supplierinvoice')),
+            ],
+            options={
+                'verbose_name': 'Supplier Payment',
+                'verbose_name_plural': 'Supplier Payments',
+                'ordering': ['-payment_date'],
+            },
+        ),
+    ]
+
+# =============================================================================
+# SECTION 5: SUPPLIERS & ACCOUNTS PAYABLE (Cash Flow Outflow Management)
+# =============================================================================
+
+class Supplier(models.Model):
+    """Vendor/Supplier master data for tracking accounts payable."""
+
+    SUPPLIER_CATEGORY_CHOICES = [
+        ('Material', 'Material Supplier'),
+        ('Subcontractor', 'Subcontractor'),
+        ('Equipment', 'Equipment Rental'),
+        ('Service', 'Professional Service'),
+        ('Utility', 'Utility / Overhead'),
+        ('Other', 'Other'),
+    ]
+
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='suppliers', null=True, blank=True
+    )
+    name = models.CharField(max_length=255)
+    contact_person = models.CharField(max_length=255, blank=True, null=True)
+    phone = models.CharField(max_length=100, blank=True, null=True)
+    email = models.EmailField(blank=True, null=True)
+    address = models.TextField(blank=True, null=True)
+    trn_number = models.CharField(max_length=100, blank=True, null=True, verbose_name="TRN / Tax ID")
+
+    category = models.CharField(
+        max_length=20, choices=SUPPLIER_CATEGORY_CHOICES, default='Material'
+    )
+    payment_terms = models.IntegerField(default=30, help_text="Payment terms in days")
+    credit_limit = models.DecimalField(
+        max_digits=15, decimal_places=2, default=0,
+        help_text="Maximum credit limit from this supplier"
+    )
+
+    # Banking details
+    bank_name = models.CharField(max_length=255, blank=True, null=True)
+    account_name = models.CharField(max_length=255, blank=True, null=True)
+    account_number = models.CharField(max_length=100, blank=True, null=True)
+    iban = models.CharField(max_length=100, blank=True, null=True)
+    swift_code = models.CharField(max_length=20, blank=True, null=True)
+
+    is_active = models.BooleanField(default=True)
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        verbose_name = "Supplier"
+        verbose_name_plural = "Suppliers"
+
+    def __str__(self):
+        return f"{self.name} ({self.get_category_display()})"
+
+    @property
+    def total_payable(self):
+        """Total outstanding amount across all unpaid invoices."""
+        from django.db.models import F, Sum
+        from decimal import Decimal
+
+        result = self.invoices.filter(
+            status__in=['Draft', 'Approved', 'Scheduled']
+        ).aggregate(
+            total=Sum(F('total_amount') - F('paid_amount'))
+        )['total'] or Decimal("0")
+        return money(result)
+
+    @property
+    def total_paid_ytd(self):
+        """Total paid year-to-date."""
+        from django.utils import timezone
+        year_start = date(timezone.now().year, 1, 1)
+        return money(
+            self.invoices.filter(
+                status='Paid',
+                actual_payment_date__gte=year_start
+            ).aggregate(total=Sum('paid_amount'))['total'] or Decimal("0")
+        )
+
+
+class SupplierInvoice(models.Model):
+    """
+    Accounts Payable - invoices received from suppliers.
+    Tracks what we owe to suppliers and when payments are due.
+    """
+
+    STATUS_CHOICES = [
+        ('Draft', 'Draft'),
+        ('Approved', 'Approved'),
+        ('Scheduled', 'Scheduled for Payment'),
+        ('Paid', 'Paid'),
+        ('Cancelled', 'Cancelled'),
+        ('Disputed', 'Disputed'),
+    ]
+
+    RECURRING_CHOICES = [
+        ('', 'One-time'),
+        ('Monthly', 'Monthly'),
+        ('Quarterly', 'Quarterly'),
+        ('Annual', 'Annual'),
+    ]
+
+    company = models.ForeignKey(
+        'CompanyProfile', on_delete=models.CASCADE,
+        related_name='supplier_invoices', null=True, blank=True
+    )
+    supplier = models.ForeignKey(
+        Supplier, on_delete=models.PROTECT, related_name='invoices'
+    )
+    project = models.ForeignKey(
+        Project, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='supplier_invoices',
+        help_text="Which project this supplier cost relates to (optional)"
+    )
+    boq_item = models.ForeignKey(
+        BOQItem, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='supplier_invoices'
+    )
+    expense_category = models.ForeignKey(
+        ExpenseCategory, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='supplier_invoices'
+    )
+
+    # Invoice details
+    supplier_inv_number = models.CharField(
+        max_length=100, verbose_name="Supplier Invoice #"
+    )
+    description = models.TextField()
+    reference_number = models.CharField(max_length=100, blank=True, null=True)
+
+    # Amounts
+    amount = models.DecimalField(max_digits=15, decimal_places=2, default=0, help_text="Net amount before VAT")
+    vat_percent = models.DecimalField(max_digits=5, decimal_places=2, default=5)
+    vat_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0, editable=False)
+    total_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0, editable=False)
+
+    # Retention (if supplier has retention held)
+    retention_percent = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    retention_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0, editable=False)
+
+    # Dates
+    invoice_date = models.DateField()
+    due_date = models.DateField()
+    expected_payment_date = models.DateField(
+        blank=True, null=True,
+        help_text="When you plan to pay this invoice (may differ from due date)"
+    )
+
+    # Status & Payment tracking
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='Draft')
+    actual_payment_date = models.DateField(blank=True, null=True)
+    paid_amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+
+    # Recurring expenses
+    is_recurring = models.BooleanField(default=False)
+    recurring_frequency = models.CharField(
+        max_length=10, choices=RECURRING_CHOICES, blank=True, default=''
+    )
+    parent_invoice = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='recurring_instances',
+        help_text="Original invoice if this is a recurring instance"
+    )
+
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-invoice_date', '-id']
+        verbose_name = "Supplier Invoice (AP)"
+        verbose_name_plural = "Supplier Invoices (AP)"
+
+    def __str__(self):
+        return f"AP-{self.supplier.name}-{self.supplier_inv_number} (AED {self.total_amount:,.2f})"
+
+    @property
+    def balance_due(self):
+        """Remaining amount to be paid."""
+        return money(self.total_amount - self.paid_amount)
+
+    @property
+    def days_overdue(self):
+        """Number of days past due date."""
+        if self.status == 'Paid':
+            return 0
+        if self.due_date >= date.today():
+            return 0
+        return (date.today() - self.due_date).days
+
+    @property
+    def aging_bucket(self):
+        """Aging bucket for reporting."""
+        if self.status == 'Paid':
+            return 'Paid'
+        days = self.days_overdue
+        if days == 0:
+            return 'Current'
+        elif days <= 30:
+            return '1-30 Days'
+        elif days <= 60:
+            return '31-60 Days'
+        elif days <= 90:
+            return '61-90 Days'
+        else:
+            return '90+ Days'
+
+    def save(self, *args, **kwargs):
+        self.vat_amount = money(self.amount * (self.vat_percent / 100))
+        self.total_amount = money(self.amount + self.vat_amount)
+        self.retention_amount = money(self.amount * (self.retention_percent / 100))
+        if not self.expected_payment_date and self.due_date:
+            self.expected_payment_date = self.due_date
+        super().save(*args, **kwargs)
+        self._sync_expense()
+
+    def _sync_expense(self):
+        from django.db import transaction
+        if not self.project or not self.expense_category:
+            return
+        with transaction.atomic():
+            expense, created = Expense.objects.get_or_create(
+                supplier_invoice=self,
+                defaults={
+                    'company': self.company,
+                    'project': self.project,
+                    'category': self.expense_category,
+                    'boq_item': self.boq_item,
+                    'supplier': self.supplier,
+                    'date': self.invoice_date,
+                    'amount': self.amount,
+                    'description': self.description or f"Supplier Invoice: {self.supplier_inv_number}",
+                    'reference_number': self.supplier_inv_number,
+                    'is_auto_generated': True,
+                }
+            )
+            if not created:
+                expense.company = self.company
+                expense.project = self.project
+                expense.category = self.expense_category
+                expense.boq_item = self.boq_item
+                expense.supplier = self.supplier
+                expense.date = self.invoice_date
+                expense.amount = self.amount
+                expense.description = self.description or f"Supplier Invoice: {self.supplier_inv_number}"
+                expense.reference_number = self.supplier_inv_number
+                expense.save()
+
+class SupplierPayment(models.Model):
+    """Records actual payments made to suppliers."""
+
+    PAYMENT_METHOD_CHOICES = [
+        ('Bank', 'Bank Transfer'),
+        ('Cash', 'Cash'),
+        ('Check', 'Check'),
+        ('Card', 'Credit Card'),
+    ]
+
+    supplier_invoice = models.ForeignKey(
+        SupplierInvoice, on_delete=models.CASCADE, related_name='payments'
+    )
+    payment_date = models.DateField()
+    amount = models.DecimalField(max_digits=15, decimal_places=2, default=0)
+    payment_method = models.CharField(
+        max_length=10, choices=PAYMENT_METHOD_CHOICES, default='Bank'
+    )
+    bank_reference = models.CharField(max_length=100, blank=True, null=True)
+    reference_number = models.CharField(max_length=100, blank=True, null=True)
+    notes = models.TextField(blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-payment_date']
+        verbose_name = "Supplier Payment"
+        verbose_name_plural = "Supplier Payments"
+
+    def __str__(self):
+        return f"Payment to {self.supplier_invoice.supplier.name}: AED {self.amount:,.2f} on {self.payment_date}"
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        # Update invoice status if fully paid
+        inv = self.supplier_invoice
+        total_paid = inv.payments.aggregate(total=Sum('amount'))['total'] or Decimal("0")
+        inv.paid_amount = total_paid
+        if inv.paid_amount >= inv.total_amount:
+            inv.status = 'Paid'
+            if not inv.actual_payment_date:
+                inv.actual_payment_date = self.payment_date
+        elif inv.paid_amount > 0:
+            inv.status = 'Scheduled'
+        inv.save(update_fields=['paid_amount', 'status', 'actual_payment_date'])
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == 'boq_item':
+            # Try to get project from request (either POST data or existing object)
+            project_id = None
+
+            # Check if we're editing an existing object
+            if request.resolver_match and hasattr(request.resolver_match, 'kwargs'):
+                object_id = request.resolver_match.kwargs.get('object_id')
+                if object_id:
+                    try:
+                        obj = SupplierInvoice.objects.get(pk=object_id)
+                        if obj.project:
+                            kwargs['queryset'] = BOQItem.objects.filter(project=obj.project)
+                        else:
+                            kwargs['queryset'] = BOQItem.objects.none()
+                    except SupplierInvoice.DoesNotExist:
+                        kwargs['queryset'] = BOQItem.objects.none()
+                else:
+                    # Adding new — can't know project yet, return empty or all
+                    kwargs['queryset'] = BOQItem.objects.none()
+            else:
+                kwargs['queryset'] = BOQItem.objects.none()
+
+        elif db_field.name == 'project':
+            # Keep your existing company scoping for project
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        elif db_field.name == 'expense_category':
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = ExpenseCategory.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        elif db_field.name == 'supplier':
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = Supplier.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        # Store project_id for formfield_for_foreignkey to use
+        if obj and obj.project_id:
+            request._supplier_invoice_project_id = obj.project_id
+        elif request.method == 'POST' and request.POST.get('project'):
+            request._supplier_invoice_project_id = request.POST.get('project')
+        return form
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        company = self.get_active_company(request)
+
+        if db_field.name == 'boq_item':
+            # Priority 1: Existing object (from get_form)
+            project_id = getattr(request, '_supplier_invoice_project_id', None)
+
+            # Priority 2: POST data for new object
+            if not project_id and request.method == 'POST':
+                project_id = request.POST.get('project')
+
+            # Priority 3: GET param (for initial load with preselected project)
+            if not project_id and request.method == 'GET':
+                project_id = request.GET.get('project')
+
+            if project_id:
+                kwargs['queryset'] = BOQItem.objects.filter(project_id=project_id)
+            else:
+                kwargs['queryset'] = BOQItem.objects.none()
+
+        elif db_field.name == 'project':
+            if company:
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        elif db_field.name == 'expense_category':
+            if company:
+                kwargs['queryset'] = ExpenseCategory.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        elif db_field.name == 'supplier':
+            if company:
+                kwargs['queryset'] = Supplier.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)
