@@ -1,16 +1,13 @@
 from django.contrib import admin
 from django.contrib.admin import AdminSite, sites as admin_sites
-from django.forms import TextInput
 from django.utils.html import format_html
-from django.utils.safestring import mark_safe
 from .models import (
     Client, Project, BOQItem, Invoice, InvoiceItem, CompanyProfile,
     ExpenseCategory, SubExpense, Expense,
     Employee, EmployeeTransfer, PayrollRecord, PayrollCostCenter, PayrollAllocation,
     PricingProject, PricingBOQItem, VariationOrder,
-    Supplier, SupplierInvoice, SupplierPayment,
+    Supplier, SupplierInvoice, SupplierPayment, ClientDeduction,
 )
-from django.urls import reverse
 from decimal import Decimal
 from django.db.models import Sum, Count, Q
 from django.shortcuts import get_object_or_404
@@ -23,17 +20,19 @@ from django.shortcuts import redirect
 from django import forms
 from .utils import money
 from django.contrib.humanize.templatetags.humanize import intcomma
-from django.utils.timezone import make_aware
 from datetime import datetime
 import json
 from django_admin_inline_paginator.admin import TabularInlinePaginated
 from django.forms.models import BaseInlineFormSet
+from .models import Invoice
+from dal import autocomplete, forward
+from django.utils.safestring import mark_safe
+from django.urls import reverse
 
 
 # =============================================================================
 # REPORTS DASHBOARD (Proxy Model for Reports Hub)
 # =============================================================================
-
 class LimitedInlineFormSet(BaseInlineFormSet):
     """Limits inline forms to max_num most recent items without slicing the queryset."""
 
@@ -57,7 +56,6 @@ class ReportsDashboard(CompanyProfile):
 # =============================================================================
 # PROFESSIONAL BASE MIXIN WITH SHARED REPORT STYLING
 # =============================================================================
-
 class ProfessionalReportMixin:
     """
     Provides consistent, professional HTML report styling across all admin views.
@@ -144,6 +142,9 @@ class ProfessionalReportMixin:
         .mt-3 { margin-top: 12px; }
         .p-2 { padding: 8px; }
         .border-top { border-top: 1px solid #dee2e6; padding-top: 8px; margin-top: 8px; }
+        .grid-5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; }
+        @media (max-width: 1200px) { .grid-5 { grid-template-columns: repeat(3, 1fr); } }
+        @media (max-width: 768px) { .grid-5 { grid-template-columns: repeat(2, 1fr); } }
     </style>
     """
 
@@ -208,6 +209,28 @@ class ProfessionalReportMixin:
             </div>
             """
         return f'<div class="grid-4">{cards}</div>'
+
+    def _number_to_words(self, number):
+        """Convert a number to words. Handles negative values with 'Minus' in parentheses."""
+        try:
+            from num2words import num2words
+            is_negative = number < 0
+            abs_number = abs(number)
+            integer_part = int(abs_number)
+            decimal_part = int((abs_number - integer_part) * 100)
+            words = num2words(integer_part, lang='en').replace(',', '').title()
+            if decimal_part > 0:
+                words += f" and {decimal_part:02d}/100"
+            if is_negative:
+                words = f"(Minus {words})"
+            return words
+        except Exception:
+            integer_part = int(abs(number))
+            decimal_part = int((abs(number) - integer_part) * 100)
+            result = f"{integer_part} and {decimal_part:02d}/100"
+            if number < 0:
+                result = f"(Minus {result})"
+            return result
 # =============================================================================
 # COMPANY SCOPING MIXIN
 # =============================================================================
@@ -326,7 +349,6 @@ class CompanyScopedAdminMixin:
 # =============================================================================
 # DYNAMIC ADMIN SITE WITH COMPANY CONTEXT
 # =============================================================================
-
 class EnhancedAdminSite(AdminSite):
     """
     Professional admin site with:
@@ -349,7 +371,17 @@ class EnhancedAdminSite(AdminSite):
             context['site_header'] = company.company_name
             context['site_title'] = f"{company.company_name} - BPM"
             context['index_title'] = f"{company.company_name} Dashboard"
-
+            context['custom_css'] = """
+                            <style>
+                                #header { background: #1a237e !important; }
+                                #site-name a { 
+                                    color: #ed6c02 !important; 
+                                    font-size: 22px !important;
+                                    font-weight: bold !important;
+                                }
+                                .dashboard-title { color: #ed6c02 !important; }
+                            </style>
+                        """
         if request.user.is_authenticated:
             context['available_companies'] = CompanyProfile.objects.filter(is_active=True)
             context['active_company'] = company
@@ -420,7 +452,8 @@ class EnhancedAdminSite(AdminSite):
                 'items': [
                     {'name': 'Clients', 'url': reverse('admin:billing_client_changelist'), 'count': client_count,
                      'badge_color': 'primary'},
-                    {'name': 'Projects', 'url': reverse('admin:billing_project_changelist'), 'count': active_project_count,
+                    {'name': 'Projects', 'url': reverse('admin:billing_project_changelist'),
+                     'count': active_project_count,
                      'badge_color': 'success'},
                     {'name': 'BOQ Items', 'url': reverse('admin:billing_boqitem_changelist'), 'count': None},
                 ]
@@ -429,7 +462,8 @@ class EnhancedAdminSite(AdminSite):
                 'name': 'Financial',
                 'icon': '💰',
                 'items': [
-                    {'name': 'Invoices', 'url': reverse('admin:billing_invoice_changelist'), 'count': invoice_alert_count,
+                    {'name': 'Invoices', 'url': reverse('admin:billing_invoice_changelist'),
+                     'count': invoice_alert_count,
                      'badge_color': 'warning'},
                     {'name': 'Expenses', 'url': reverse('admin:billing_expense_changelist'), 'count': None},
                     {'name': 'Expense Categories', 'url': reverse('admin:billing_expensecategory_changelist'),
@@ -494,7 +528,6 @@ class EnhancedAdminSite(AdminSite):
         """Build key metrics for the dashboard using only DB fields."""
         from django.db.models import Sum, Q
         from decimal import Decimal
-
 
         total_projects = Project.objects.filter(company=company).count()
         # FIX: Active projects based on retention status, not BOQ completion
@@ -739,6 +772,8 @@ class EnhancedAdminSite(AdminSite):
             'expenses_json': json.dumps(expenses),
             'profits_json': json.dumps(profits),
         }
+
+
 # Replace the default admin site
 admin.site = EnhancedAdminSite(name="admin")
 admin_sites.site = admin.site
@@ -749,11 +784,10 @@ admin_sites.site = admin.site
 # =============================================================================
 
 @admin.register(ReportsDashboard)
-class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelAdmin):
-
-    #In case I need it in the futrue
-    #def get_active_company(self, request):
-        #return CompanyProfile.get_active(request)
+class ReportsDashboardAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelAdmin):
+    # In case I need it in the futrue
+    # def get_active_company(self, request):
+    # return CompanyProfile.get_active(request)
     """
     Central Reports Hub - provides access to all reports from one place.
     This is a proxy model admin that serves as a navigation hub.
@@ -830,6 +864,35 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
                 ]
             },
             {
+                'name': 'Supplier Reports',
+                'icon': '🏭',
+                'description': 'Supplier statements, outstanding balances, and aging analysis',
+                'color': '#6a1b9a',
+                'reports': [
+                    {
+                        'name': 'Supplier Statement',
+                        'description': 'Full supplier ledger with invoice history, payments, and aging buckets',
+                        'url': reverse('admin:supplier_statement_list'),
+                        'icon': '📄',
+                        'badge': 'Financial',
+                    },
+                    {
+                        'name': 'Supplier Outstanding',
+                        'description': 'Unpaid supplier invoices with current and overdue breakdown',
+                        'url': reverse('admin:supplier_outstanding_list'),
+                        'icon': '⚠️',
+                        'badge': 'Aging',
+                    },
+                    {
+                        'name': 'Supplier Aging',
+                        'description': 'Accounts payable aging with bucket analysis and client-paid tracking',
+                        'url': reverse('admin:supplier_aging_list'),
+                        'icon': '📊',
+                        'badge': 'Analytics',
+                    },
+                ]
+            },
+            {
                 'name': 'Cash Flow',
                 'icon': '💰',
                 'description': 'Cash flow predictions, supplier aging, and liquidity forecasting',
@@ -871,6 +934,13 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
                         'icon': '📦',
                         'badge': 'Deductions',
                     },
+                    {
+                        'name': 'Project Statement',
+                        'description': 'Statement of final dues with current vs completed comparison and Excel export',
+                        'url': reverse('admin:project_statement_list'),
+                        'icon': '📋',
+                        'badge': 'Statement',
+                    },
                 ]
             },
             {
@@ -890,8 +960,8 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
             },
             {
                 'name': 'Payroll Reports',
-                'icon': '💰',
-                'description': 'Timesheets, labor costs, and payment method reports',
+                'icon': '👷',
+                'description': 'Timesheets, labor costs, and payment method reports with month selection',
                 'color': '#4a148c',
                 'reports': [
                     {
@@ -910,21 +980,21 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
                     },
                     {
                         'name': 'Staff Payroll Report',
-                        'description': 'Office staff bank transfer payment summary',
+                        'description': 'Office staff bank transfer payment summary with month selection',
                         'url': reverse('admin:payroll_staff_report_list'),
                         'icon': '🏢',
                         'badge': 'Bank',
                     },
                     {
                         'name': 'WPS Report',
-                        'description': 'Site workers WPS agency payment report',
+                        'description': 'Site workers WPS agency payment report with month selection',
                         'url': reverse('admin:payroll_wps_report_list'),
                         'icon': '💳',
                         'badge': 'WPS',
                     },
                     {
                         'name': 'Cash Payroll Report',
-                        'description': 'Cash payment workers summary with signatures',
+                        'description': 'Cash payment workers summary with signatures and month selection',
                         'url': reverse('admin:payroll_cash_report_list'),
                         'icon': '💵',
                         'badge': 'Cash',
@@ -1871,7 +1941,8 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
 
         inflow_rows = ""
         for item in sorted(inflow_items, key=lambda x: x['estimated_date']):
-            conf_color = "#2e7d32" if item['confidence'] == 'Confirmed' else "#f57c00" if item['confidence'] == 'High' else "#ed6c02"
+            conf_color = "#2e7d32" if item['confidence'] == 'Confirmed' else "#f57c00" if item[
+                                                                                              'confidence'] == 'High' else "#ed6c02"
             inflow_rows += f"""
             <tr>
                 <td class="center">{item['estimated_date'].strftime('%d-%b-%Y')}</td>
@@ -2152,8 +2223,8 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
 
     def get_urls(self):
         urls = super().get_urls()
-        # These URLs serve as entry points that redirect to actual report lists
         custom = [
+            # Client reports
             path('client-statements/', self.admin_site.admin_view(self.client_statement_list),
                  name='client_statement_list'),
             path('client-outstanding/', self.admin_site.admin_view(self.client_outstanding_list),
@@ -2161,14 +2232,29 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
             path('client-progress/', self.admin_site.admin_view(self.client_progress_list),
                  name='client_progress_list'),
             path('client-deductions/', self.admin_site.admin_view(self.client_deductions_list),
-                 name='client_deductions_list'),  # <-- ADD THIS
+                 name='client_deductions_list'),
+
+            # Supplier reports (NEW)
+            path('supplier-statements/', self.admin_site.admin_view(self.supplier_statement_list),
+                 name='supplier_statement_list'),
+            path('supplier-outstanding/', self.admin_site.admin_view(self.supplier_outstanding_list),
+                 name='supplier_outstanding_list'),
+            path('supplier-aging/', self.admin_site.admin_view(self.supplier_aging_list), name='supplier_aging_list'),
+
+            # Project reports
             path('project-analytics/', self.admin_site.admin_view(self.project_analytics_list),
                  name='project_analytics_list'),
             path('project-cost-profit/', self.admin_site.admin_view(self.project_cost_profit_list),
                  name='project_cost_profit_list'),
             path('project-deductions/', self.admin_site.admin_view(self.project_deductions_list),
-                 name='project_deductions_list'),  # <-- ADD THIS
+                 name='project_deductions_list'),
+            path('project-statement/', self.admin_site.admin_view(self.project_statement_list),
+                 name='project_statement_list'),
+
+            # Invoice reports
             path('invoice-print/', self.admin_site.admin_view(self.invoice_print_list), name='invoice_print_list'),
+
+            # Payroll reports (with month selection)
             path('payroll-timesheet/', self.admin_site.admin_view(self.payroll_timesheet_list),
                  name='payroll_timesheet_list'),
             path('payroll-labor-cost/', self.admin_site.admin_view(self.payroll_labor_cost_list),
@@ -2179,6 +2265,8 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
                  name='payroll_wps_report_list'),
             path('payroll-cash/', self.admin_site.admin_view(self.payroll_cash_report_list),
                  name='payroll_cash_report_list'),
+
+            # Consolidated reports
             path('materials-supplied/', self.admin_site.admin_view(self.materials_supplied_report),
                  name='materials_supplied_report'),
             path('retention-held/', self.admin_site.admin_view(self.retention_held_report),
@@ -2226,7 +2314,133 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
 
     def payroll_cash_report_list(self, request):
         return redirect(reverse('admin:payroll_cash_report') + '?month=' + date.today().strftime('%Y-%m'))
+    #########
+        # Supplier report selectors (NEW)
+    def supplier_statement_list(self, request):
+        return self._report_selector(request, Supplier, 'admin:supplier_statement', 'Supplier Statement of Account')
 
+    def supplier_outstanding_list(self, request):
+        return self._report_selector(request, Supplier, 'admin:supplier_outstanding', 'Supplier Outstanding Report')
+
+    def supplier_aging_list(self, request):
+        return self._report_selector(request, Supplier, 'admin:supplier_aging', 'Supplier Aging Report')
+
+        # Project statement selector (NEW - was missing)
+    def project_statement_list(self, request):
+        return self._report_selector(request, Project, 'admin:project_statement', 'Project Statement of Final Dues')
+
+        # Payroll report selectors with month selection (UPDATED)
+    def payroll_timesheet_list(self, request):
+        return self._report_selector(request, PayrollRecord, 'admin:payroll_timesheet', 'Worker Time Sheet')
+
+    def payroll_labor_cost_list(self, request):
+        return redirect(reverse('admin:payroll_labor_cost'))
+
+    def payroll_staff_report_list(self, request):
+            """Staff payroll report with month selection page"""
+            return self._payroll_month_selector(request, 'admin:payroll_staff_report','Staff Payroll Report (Bank Transfer)')
+
+    def payroll_wps_report_list(self, request):
+            """WPS payroll report with month selection page"""
+            return self._payroll_month_selector(request, 'admin:payroll_wps_report', 'WPS Payroll Report')
+
+    def payroll_cash_report_list(self, request):
+            """Cash payroll report with month selection page"""
+            return self._payroll_month_selector(request, 'admin:payroll_cash_report', 'Cash Payroll Report')
+
+    def _payroll_month_selector(self, request, url_name, report_title):
+        """
+        Show a month selector page for payroll reports before redirecting.
+        """
+        company = self.get_active_company(request)
+
+        if request.GET.get("month"):
+            month = request.GET.get("month")
+            return redirect(reverse(url_name) + "?month=" + month)
+
+        # Generate last 12 months options
+        month_options = []
+        today = date.today()
+        for i in range(12):
+            month_date = (today.replace(day=1) - timedelta(days=i * 30)).replace(day=1)
+            month_options.append({
+                "value": month_date.strftime("%Y-%m"),
+                "label": month_date.strftime("%B %Y")
+            })
+
+        # Build options HTML using string concatenation (no f-string quote issues)
+        options_html = ""
+        for opt in month_options:
+            options_html += '<option value="' + opt["value"] + '">' + opt["label"] + "</option>\n"
+
+        back_url = reverse("admin:billing_reportsdashboard_changelist")
+
+        # Build HTML using string concatenation to avoid quote escaping
+        html = (
+                '<!DOCTYPE html>\n<html>\n<head>\n<meta charset="UTF-8">\n'
+                + self.SHARED_CSS
+                + """
+    <style>
+        .selector-container { max-width: 600px; margin: 0 auto; padding: 40px 20px; }
+        .selector-header { text-align: center; margin-bottom: 30px; padding-bottom: 20px; border-bottom: 3px solid #1a237e; }
+        .selector-header h1 { font-size: 22px; color: #1a237e; margin-bottom: 8px; }
+        .selector-header p { color: #6c757d; font-size: 12px; }
+        .month-form { margin-top: 20px; }
+        .month-select { 
+            width: 100%; padding: 14px; font-size: 16px; border: 2px solid #dee2e6; 
+            border-radius: 8px; margin-bottom: 20px; background: white; cursor: pointer;
+        }
+        .month-select:focus { border-color: #1a237e; outline: none; }
+        .submit-btn { 
+            width: 100%; padding: 14px; background: #1a237e; color: white; 
+            border: none; border-radius: 8px; font-size: 16px; font-weight: 600; 
+            cursor: pointer; transition: all 0.2s;
+        }
+        .submit-btn:hover { background: #283593; }
+        .back-link { 
+            display: inline-block; margin-bottom: 20px; 
+            color: #1a237e; text-decoration: none; font-size: 12px; font-weight: 600;
+        }
+        .back-link:hover { text-decoration: underline; }
+        .info-box { 
+            background: #e3f2fd; border-left: 4px solid #1a237e; 
+            padding: 12px 16px; margin-bottom: 20px; border-radius: 4px;
+            font-size: 11px; color: #1a237e;
+        }
+    </style>
+    </head>
+    <body>
+        <div class="report-container">
+            <div class="selector-container">
+                <a href="""
+                + back_url
+                + """" class="back-link">&larr; Back to Reports Dashboard</a>
+                <div class="selector-header">
+                    <h1>"""
+                + report_title
+                + """</h1>
+                    <p>Select a month to generate the report</p>
+                </div>
+                <div class="info-box">
+                    <b>Tip:</b> Select the payroll month you want to print. The report will include all employees 
+                    with payroll records for the selected month.
+                </div>
+                <form method="get" class="month-form">
+                    <select name="month" class="month-select" required>
+                        <option value="">-- Select Month --</option>
+                        """
+                + options_html
+                + """
+                    </select>
+                    <button type="submit" class="submit-btn">Generate Report &rarr;</button>
+                </form>
+            </div>
+        </div>
+    </body>
+    </html>"""
+        )
+        return HttpResponse(html)
+    #########
     def _report_selector(self, request, model, url_name, report_title):
         """FIX: Show a professional selector page with all available objects instead of redirecting to first."""
         company = self.get_active_company(request)
@@ -2369,6 +2583,7 @@ class ReportsDashboardAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, adm
 </html>"""
         return HttpResponse(html)
 
+
 # =============================================================================
 # COMPANY PROFILE ADMIN
 # =============================================================================
@@ -2381,9 +2596,13 @@ class CompanyProfileAdmin(ProfessionalReportMixin, admin.ModelAdmin):
 
     def logo_preview(self, obj):
         if obj.logo:
-            return format_html('<img src="{}" style="max-height:80px; max-width:!80px; border-radius:4px;" />', obj.logo.url)
+            return format_html('<img src="{}" style="max-height:80px; max-width:!80px; border-radius:4px;" />',
+                               obj.logo.url)
         return "—"
+
     logo_preview.short_description = "Logo"
+
+
 # =============================================================================
 # CLIENT ADMIN
 # =============================================================================
@@ -2959,7 +3178,7 @@ class ClientAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelA
         company = self.get_active_company(request)
         client = self.get_object_or_404_scoped(request, Client, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
-
+        vat_rate = getattr(company, 'vat_percent', None) or Decimal("5")
         base_filter = {'project__client': client}
         if company:
             base_filter['project__company'] = company
@@ -3037,7 +3256,11 @@ class ClientAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelA
             grand_est_back_charges += est_back_charges
             grand_liquidated += liquidated
             grand_net_deductions += proj_net_deductions
-
+            grand_client_deductions = sum(
+                (d.amount for d in ClientDeduction.objects.filter(project__in=projects)),
+                Decimal("0")
+            )
+            grand_client_deductions_vat = money(grand_client_deductions * (vat_rate / Decimal("100")))
             # Invoice-level deduction detail rows
             inv_deduction_rows = ""
             for inv in invoices:
@@ -3165,6 +3388,7 @@ class ClientAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelA
             'Active Projects': projects.count()
         })}
 
+
         <!-- Grand Summary Dashboard -->
         <div class="card" style="background: #1a237e; color: white; margin-bottom: 20px;">
             <div class="card-header" style="color: white; border-color: rgba(255,255,255,0.3);">
@@ -3186,6 +3410,35 @@ class ClientAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelA
                 <div class="metric-card" style="background: rgba(255,255,255,0.1); border: none; color: white;">
                     <div class="metric-value" style="color: white;">AED {grand_other:,.2f}</div>
                     <div class="metric-label" style="color: rgba(255,255,255,0.8);">Other Deductions</div>
+                </div>
+            </div>
+            <div class="grid-5">
+                <div class="metric-card" style="background: rgba(255,255,255,0.1); border: none; color: white;">
+                    <div class="metric-value" style="color: white;">AED {grand_materials:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.8);">Materials Supplied</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.6); margin-top: 4px;">Client-supplied materials (VAT excl.)</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.1); border: none; color: white;">
+                    <div class="metric-value" style="color: white;">AED {net_ret_held:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.8);">Net Retention Held</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.6); margin-top: 4px;">
+                        A: {money(ret_a_cum - ret_a_rec):,.2f} | B: {money(ret_b_cum - ret_b_rec):,.2f}
+                    </div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.1); border: none; color: white;">
+                    <div class="metric-value" style="color: white;">AED {advance_rec:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.8);">Advance Recovered</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.6); margin-top: 4px;">of {advance_total:,.2f} total advance</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.1); border: none; color: white;">
+                    <div class="metric-value" style="color: white;">AED {grand_client_deductions:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.8);">Client Deductions</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.6); margin-top: 4px;">Supplier payments via client</div>
+                </div>
+                <div class="metric-card" style="background: rgba(255,255,255,0.1); border: none; color: white;">
+                    <div class="metric-value" style="color: white;">AED {back_charges + est_back_charges + liquidated:,.2f}</div>
+                    <div class="metric-label" style="color: rgba(255,255,255,0.8);">Other Deductions</div>
+                    <div style="font-size: 8px; color: rgba(255,255,255,0.6); margin-top: 4px;">Back charges, LD, estimates</div>
                 </div>
             </div>
             <div style="text-align: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.2);">
@@ -3261,6 +3514,20 @@ class ClientAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelA
                         <td class="num font-bold text-danger">({grand_liquidated:,.2f})</td>
                         <td><span class="badge badge-danger">Permanent Deduction</span></td>
                     </tr>
+                    <tr>
+                        <td><b>Client Deductions (Supplier Payments via Client)</b></td>
+                        <td class="num text-danger">({grand_client_deductions:,.2f})</td>
+                        <td class="num text-success">—</td>
+                        <td class="num font-bold text-danger">({grand_client_deductions:,.2f})</td>
+                        <td><span class="badge badge-danger">Permanent Deduction</span></td>
+                    </tr>
+                    <tr style="background:#FFEBEE;">
+                        <td><b>VAT Input on Client Deductions ({vat_rate}%)</b></td>
+                        <td class="num text-success">{grand_client_deductions_vat:,.2f}</td>
+                        <td class="num text-success">—</td>
+                        <td class="num font-bold text-success">{grand_client_deductions_vat:,.2f}</td>
+                        <td><span class="badge badge-info">Input VAT Claim</span></td>
+                    </tr>
                 </tbody>
                 <tfoot>
                     <tr class="grand-total">
@@ -3295,6 +3562,7 @@ class ClientAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelA
             logo_url
         ))
 
+
 # =============================================================================
 # BOQ ITEM ADMIN
 # =============================================================================
@@ -3307,14 +3575,17 @@ class BOQItemAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
     def fmt_qty(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.quantity:,.2f}</div>')
+
     fmt_qty.short_description = "Qty"
 
     def fmt_rate(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.rate:,.2f}</div>')
+
     fmt_rate.short_description = "Rate"
 
     def fmt_total(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.quantity * obj.rate:,.2f}</div>')
+
     fmt_total.short_description = "Total"
 
     def get_urls(self):
@@ -3421,7 +3692,7 @@ class ExpenseInline(admin.TabularInline):
 
 
 @admin.register(Project)
-class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelAdmin):
+class ProjectAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelAdmin):
     company_field_path = 'company'
     inlines = [BOQItemInline, ExpenseInline]
     list_display = [
@@ -3461,6 +3732,7 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
             '</div>',
             invoices_url, analytics_url, cost_url, statement_url, deductions_url  # Added deductions_url
         )
+
     action_buttons.short_description = "Actions"
     action_buttons.admin_order_field = "project_id_code"
 
@@ -3468,30 +3740,11 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
         if logo_url:
             return f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>'
         return ''
-#############
-    def _number_to_words(self, number):
-        """Convert a number to words. Handles negative values with 'Minus' in parentheses."""
-        try:
-            from num2words import num2words
-            is_negative = number < 0
-            abs_number = abs(number)
-            integer_part = int(abs_number)
-            decimal_part = int((abs_number - integer_part) * 100)
-            words = num2words(integer_part, lang='en').replace(',', '').title()
-            if decimal_part > 0:
-                words += f" and {decimal_part:02d}/100"
-            if is_negative:
-                words = f"(Minus {words})"
-            return words
-        except Exception:
-            integer_part = int(abs(number))
-            decimal_part = int((abs(number) - integer_part) * 100)
-            result = f"{integer_part} and {decimal_part:02d}/100"
-            if number < 0:
-                result = f"(Minus {result})"
-            return result
 
-#############
+    #############
+
+
+    #############
     def cost_profit_view(self, request, pk):
         company = self.get_active_company(request)
         proj = self.get_object_or_404_scoped(request, Project, pk=pk)
@@ -3745,124 +3998,138 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
         <script>window.onload = function() {{ window.print(); }}</script>
     </body></html>"""
         return HttpResponse(html)
-#############
+
+    #############
 
     def project_statement_view(self, request, pk):
-            """
-            Professional Project Statement of Final Dues.
-            Two-column layout: Current Statement vs Project Completed.
-            Supports ?format=excel for XLSX download.
-            """
-            from decimal import Decimal
-            from django.db.models import Sum
-            from datetime import date
+        """
+        Professional Project Statement of Final Dues.
+        Two-column layout: Current Statement vs Project Completed.
+        Supports ?format=excel for XLSX download.
+        """
+        from decimal import Decimal
+        from django.db.models import Sum
+        from datetime import date
 
-            company = self.get_active_company(request)
-            proj = self.get_object_or_404_scoped(request, Project, pk=pk)
+        company = self.get_active_company(request)
+        proj = self.get_object_or_404_scoped(request, Project, pk=pk)
 
-            # Check if Excel export requested
-            if request.GET.get('format') == 'excel':
-                return self._project_statement_excel(request, proj, company)
+        # Check if Excel export requested
+        if request.GET.get('format') == 'excel':
+            return self._project_statement_excel(request, proj, company)
 
-            logo_url = company.logo.url if company and company.logo else ''
+        logo_url = company.logo.url if company and company.logo else ''
 
-            invoices = Invoice.objects.filter(
-                project=proj, inv_type='T'
-            ).exclude(is_advance_invoice=True).order_by('inv_number')
+        invoices = Invoice.objects.filter(
+            project=proj, inv_type='T'
+        ).exclude(is_advance_invoice=True).order_by('inv_number')
 
-            latest_inv = invoices.order_by('-inv_number').first()
+        client_deductions_total = ClientDeduction.objects.filter(
+            project=proj,
+            invoice__in=invoices
+        ).aggregate(total=Sum('amount'))['total'] or Decimal("0")
 
-            original_po = proj.po_amount
-            amendments = getattr(proj, 'amendment_amount', Decimal("0"))
-            variations = getattr(proj, 'variation_amount', Decimal("0"))
-            final_contract_value = original_po + amendments + variations
+        vat_rate = Decimal("5")  # or from settings
+        client_deductions_vat_input = money(client_deductions_total * vat_rate / Decimal("100"))
 
-            certified_work = latest_inv.cumulative_work_done if latest_inv else Decimal("0")
-            total_materials = sum(
-                (inv.material_supplied_by_client or Decimal("0")) for inv in invoices
-            )
-            back_charges = getattr(proj, 'back_charges', Decimal("0"))
-            estimated_back_charges = getattr(proj, 'estimated_back_charges', Decimal("0"))
-            liquidated_damages = getattr(proj, 'liquidated_damages', Decimal("0"))
+        latest_inv = invoices.order_by('-inv_number').first()
 
-            # Net Amount Payable (shown in statement)
-            net_payable = final_contract_value - total_materials - back_charges - estimated_back_charges - liquidated_damages
+        original_po = proj.po_amount
+        amendments = getattr(proj, 'amendment_amount', Decimal("0"))
+        variations = getattr(proj, 'variation_amount', Decimal("0"))
+        final_contract_value = original_po + amendments + variations
 
-            # Previously Paid (Net) shows amount AFTER deducting materials
-            paid_invoices = invoices.filter(status='Paid')
-            previously_paid = sum(
-                (inv.current_certified_net_before_vat or Decimal("0")) for inv in paid_invoices
-            )
-            previously_paid_net = money(previously_paid - total_materials)
-            advance_paid = getattr(proj, 'advance_paid', Decimal("0"))
+        certified_work = latest_inv.cumulative_work_done if latest_inv else Decimal("0")
+        total_materials = sum(
+            (inv.material_supplied_by_client or Decimal("0")) for inv in invoices
+        )
+        back_charges = getattr(proj, 'back_charges', Decimal("0"))
+        estimated_back_charges = getattr(proj, 'estimated_back_charges', Decimal("0"))
+        liquidated_damages = getattr(proj, 'liquidated_damages', Decimal("0"))
 
-            ret_a_pct = proj.retention_a_percent or Decimal("0")
-            ret_b_pct = proj.retention_b_percent or Decimal("0")
+        # Net Amount Payable (shown in statement)
+        net_payable = (final_contract_value
+                       - total_materials
+                       - back_charges
+                       - estimated_back_charges
+                       - liquidated_damages
+                       - client_deductions_total)
 
-            ret_a_cum = latest_inv.cumulative_retention_a if latest_inv else Decimal("0")
-            ret_b_cum = latest_inv.cumulative_retention_b if latest_inv else Decimal("0")
-            ret_a_rec = latest_inv.cumulative_retention_a_recovered if latest_inv else Decimal("0")
-            ret_b_rec = latest_inv.cumulative_retention_b_recovered if latest_inv else Decimal("0")
+        # Previously Paid (Net) shows amount AFTER deducting materials
+        paid_invoices = invoices.filter(status='Paid')
+        previously_paid = sum(
+            (inv.current_certified_net_before_vat or Decimal("0")) for inv in paid_invoices
+        )
+        previously_paid_net = money(previously_paid - total_materials)
+        advance_paid = getattr(proj, 'advance_paid', Decimal("0"))
 
-            total_retention_held = (ret_a_cum + ret_b_cum) - (ret_a_rec + ret_b_rec)
-            total_retention_deducted = ret_a_cum + ret_b_cum
+        ret_a_pct = proj.retention_a_percent or Decimal("0")
+        ret_b_pct = proj.retention_b_percent or Decimal("0")
 
-            completed_ret_a = final_contract_value * ret_a_pct / Decimal("100")
-            completed_ret_b = final_contract_value * ret_b_pct / Decimal("100")
-            completed_retention = completed_ret_a + completed_ret_b
+        ret_a_cum = latest_inv.cumulative_retention_a if latest_inv else Decimal("0")
+        ret_b_cum = latest_inv.cumulative_retention_b if latest_inv else Decimal("0")
+        ret_a_rec = latest_inv.cumulative_retention_a_recovered if latest_inv else Decimal("0")
+        ret_b_rec = latest_inv.cumulative_retention_b_recovered if latest_inv else Decimal("0")
 
-            # FIXED: Use net_payable (not current_net_base) for consistency
-            # The statement shows "Net Amount Payable" which is based on final_contract_value
-            # So Total Net Payable should also use net_payable
-            current_amount_payable = net_payable - total_retention_held - previously_paid_net - advance_paid
+        total_retention_held = (ret_a_cum + ret_b_cum) - (ret_a_rec + ret_b_rec)
+        total_retention_deducted = ret_a_cum + ret_b_cum
 
-            completed_amount_payable = net_payable - completed_retention - previously_paid_net - advance_paid
+        completed_ret_a = final_contract_value * ret_a_pct / Decimal("100")
+        completed_ret_b = final_contract_value * ret_b_pct / Decimal("100")
+        completed_retention = completed_ret_a + completed_ret_b
 
-            progress_pct = (certified_work / final_contract_value * 100) if final_contract_value > 0 else Decimal("0")
+        # FIXED: Use net_payable (not current_net_base) for consistency
+        # The statement shows "Net Amount Payable" which is based on final_contract_value
+        # So Total Net Payable should also use net_payable
+        current_amount_payable = net_payable - total_retention_held - previously_paid_net - advance_paid
 
-            # Helper function for formatting values - DEFINED FIRST
-            def _money(val):
-                return Decimal(str(val)) if val is not None else Decimal("0")
+        completed_amount_payable = net_payable - completed_retention - previously_paid_net - advance_paid
 
-            def fmt_negative(val):
-                """Format negative values in parentheses with red color."""
-                val = _money(val)
-                if val < 0:
-                    return f'<span style="color: #c62828;">({abs(val):,.2f})</span>'
-                return f'{val:,.2f}'
+        progress_pct = (certified_work / final_contract_value * 100) if final_contract_value > 0 else Decimal("0")
 
-            def fmt_negative_plain(val):
-                """Format negative values for words - show minus in parentheses."""
-                val = _money(val)
-                if val < 0:
-                    return f"(Minus {self._number_to_words(abs(val))})"
-                return self._number_to_words(val)
+        # Helper function for formatting values - DEFINED FIRST
+        def _money(val):
+            return Decimal(str(val)) if val is not None else Decimal("0")
 
-            def fmt_negative_label(val):
-                """Format label values (deductions) - always show in parentheses."""
-                val = _money(val)
-                if val < 0:
-                    return f'<span style="color: #c62828;">({abs(val):,.2f})</span>'
-                return f'({val:,.2f})'
+        def fmt_negative(val):
+            """Format negative values in parentheses with red color."""
+            val = _money(val)
+            if val < 0:
+                return f'<span style="color: #c62828;">({abs(val):,.2f})</span>'
+            return f'{val:,.2f}'
 
-            def fmt_grand_total(val):
-                """Format grand total - ALWAYS white text, negative shown in parentheses."""
-                val = _money(val)
-                if val < 0:
-                    return f'({abs(val):,.2f})'
-                return f'{val:,.2f}'
+        def fmt_negative_plain(val):
+            """Format negative values for words - show minus in parentheses."""
+            val = _money(val)
+            if val < 0:
+                return f"(Minus {self._number_to_words(abs(val))})"
+            return self._number_to_words(val)
 
-            # Build invoice rows
-            inv_rows = ""
-            for inv in invoices:
-                net = inv.current_certified_net_before_vat or Decimal("0")
-                if inv.status == 'Paid':
-                    badge = '<span class="badge badge-success">Paid</span>'
-                elif inv.status == 'Approved':
-                    badge = '<span class="badge badge-info">Approved</span>'
-                else:
-                    badge = '<span class="badge badge-warning">Draft</span>'
-                inv_rows += f"""<tr>
+        def fmt_negative_label(val):
+            """Format label values (deductions) - always show in parentheses."""
+            val = _money(val)
+            if val < 0:
+                return f'<span style="color: #c62828;">({abs(val):,.2f})</span>'
+            return f'({val:,.2f})'
+
+        def fmt_grand_total(val):
+            """Format grand total - ALWAYS white text, negative shown in parentheses."""
+            val = _money(val)
+            if val < 0:
+                return f'({abs(val):,.2f})'
+            return f'{val:,.2f}'
+
+        # Build invoice rows
+        inv_rows = ""
+        for inv in invoices:
+            net = inv.current_certified_net_before_vat or Decimal("0")
+            if inv.status == 'Paid':
+                badge = '<span class="badge badge-success">Paid</span>'
+            elif inv.status == 'Approved':
+                badge = '<span class="badge badge-info">Approved</span>'
+            else:
+                badge = '<span class="badge badge-warning">Draft</span>'
+            inv_rows += f"""<tr>
                         <td class="center">{inv.inv_number}</td>
                         <td class="center">{inv.date.strftime('%d-%b-%Y')}</td>
                         <td class="center">{badge}</td>
@@ -3875,429 +4142,467 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
                         <td class="num font-bold">{inv.total_after_vat:,.2f}</td>
                     </tr>"""
 
-            html = f"""<!DOCTYPE html>
-    <html><head><meta charset="UTF-8">
-    <style>
-        @page {{ size: A4 portrait; margin: 10mm; }}
-        * {{ box-sizing: border-box; margin: 0; padding: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
-        body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 9px; color: #222; line-height: 1.4; }}
-        .page {{ padding: 8mm; }}
-        .logo-bar {{ text-align: right; margin-bottom: 8px; }}
-        .logo-bar img {{ max-height: 100px; max-width: 200px; object-fit: contain; }}
-        .report-header {{ text-align: center; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 3px solid #1a237e; }}
-        .report-title {{ font-size: 16px; font-weight: 700; color: #1a237e; text-transform: uppercase; letter-spacing: 1px; }}
-        .report-subtitle {{ font-size: 10px; color: #6c757d; margin-top: 4px; }}
-        .meta-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 15px; }}
-        .meta-item {{ background: #f8f9fa; padding: 8px 10px; border-radius: 4px; border-left: 3px solid #1a237e; }}
-        .meta-label {{ font-size: 7px; text-transform: uppercase; color: #6c757d; letter-spacing: 0.5px; margin-bottom: 2px; }}
-        .meta-value {{ font-size: 10px; font-weight: 600; color: #212529; }}
-        .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px; }}
-        .col-panel {{ border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden; }}
-        .col-header {{ background: #1a237e; color: white; padding: 8px 12px; font-size: 11px; font-weight: 700; text-align: center; }}
-        .col-header.completed {{ background: #00695c; }}
-        .col-body {{ padding: 10px; }}
-        .stmt-table {{ width: 100%; border-collapse: collapse; font-size: 9px; }}
-        .stmt-table td {{ padding: 5px 8px; border-bottom: 1px solid #e9ecef; vertical-align: middle; }}
-        .stmt-table .label {{ text-align: left; font-weight: 600; color: #495057; width: 55%; }}
-        .stmt-table .value {{ text-align: right; font-weight: 700; color: #212529; width: 45%; }}
-        .stmt-table .deduction {{ color: #c62828; }}
-        .stmt-table .total-row td {{ background: #e8eaf6; border-top: 2px solid #1a237e; font-size: 10px; }}
-        .stmt-table .grand-total td {{ background: #1a237e; color: white; font-size: 11px; font-weight: 700; }}
-        .stmt-table .grand-total .value {{ color: white; }}
-        .inv-table {{ width: 100%; border-collapse: collapse; font-size: 8px; margin-top: 10px; }}
-        .inv-table th {{ background: #1a237e; color: white; padding: 6px 4px; font-weight: 600; text-align: center; font-size: 7px; text-transform: uppercase; }}
-        .inv-table td {{ border: 1px solid #dee2e6; padding: 4px; text-align: center; }}
-        .inv-table .num {{ text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }}
-        .inv-table tr:nth-child(even) {{ background: #f8f9fa; }}
-        .badge {{ display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 7px; font-weight: 700; text-transform: uppercase; }}
-        .badge-success {{ background: #e8f5e9; color: #2e7d32; }}
-        .badge-info {{ background: #e3f2fd; color: #0277bd; }}
-        .badge-warning {{ background: #fff3e0; color: #f57c00; }}
-        .signature-section {{ margin-top: 30px; padding-top: 20px; border-top: 2px solid #1a237e; }}
-        .signature-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 40px; margin-top: 20px; }}
-        .sig-block {{ text-align: center; }}
-        .sig-line {{ border-top: 1px solid #333; margin-top: 50px; padding-top: 8px; font-size: 9px; font-weight: 600; }}
-        .amount-words {{ text-align: center; margin: 15px 0; padding: 10px; background: #f8f9fa; border-radius: 6px; font-size: 10px; font-weight: 600; color: #1a237e; }}
-        .amount-words.negative {{ color: #c62828; }}
-        .section-title {{ font-size: 11px; font-weight: 700; color: #1a237e; margin: 15px 0 8px 0; padding-bottom: 5px; border-bottom: 2px solid #1a237e; }}
-        .progress-bar {{ width: 100%; height: 20px; background: #e0e0e0; border-radius: 10px; overflow: hidden; margin: 8px 0; }}
-        .progress-fill {{ height: 100%; background: linear-gradient(90deg, #447e9b, #2e7d32); border-radius: 10px; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; color: white; font-size: 8px; font-weight: 700; }}
-        .excel-btn {{ display: inline-block; background: #217346; color: white; padding: 8px 16px; border-radius: 4px; text-decoration: none; font-size: 11px; font-weight: 600; margin-bottom: 15px; }}
-        .excel-btn:hover {{ background: #1e663f; }}
-    </style></head>
-    <body>
-        <div class="page">
-            <div class="logo-bar">{f'<img src="{logo_url}" alt="Logo">' if logo_url else ''}</div>
+        html = f"""<!DOCTYPE html>
+            <html><head><meta charset="UTF-8">
+            <style>
+                @page {{ size: A4 portrait; margin: 10mm; }}
+                * {{ box-sizing: border-box; margin: 0; padding: 0; -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+                body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 9px; color: #222; line-height: 1.4; }}
+                .page {{ padding: 8mm; }}
+                .logo-bar {{ text-align: right; margin-bottom: 8px; }}
+                .logo-bar img {{ max-height: 100px; max-width: 200px; object-fit: contain; }}
+                .report-header {{ text-align: center; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 3px solid #1a237e; }}
+                .report-title {{ font-size: 16px; font-weight: 700; color: #1a237e; text-transform: uppercase; letter-spacing: 1px; }}
+                .report-subtitle {{ font-size: 10px; color: #6c757d; margin-top: 4px; }}
+                .meta-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 15px; }}
+                .meta-item {{ background: #f8f9fa; padding: 8px 10px; border-radius: 4px; border-left: 3px solid #1a237e; }}
+                .meta-label {{ font-size: 7px; text-transform: uppercase; color: #6c757d; letter-spacing: 0.5px; margin-bottom: 2px; }}
+                .meta-value {{ font-size: 10px; font-weight: 600; color: #212529; }}
+                .two-col {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px; }}
+                .col-panel {{ border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden; }}
+                .col-header {{ background: #1a237e; color: white; padding: 8px 12px; font-size: 11px; font-weight: 700; text-align: center; }}
+                .col-header.completed {{ background: #00695c; }}
+                .col-body {{ padding: 10px; }}
+                .stmt-table {{ width: 100%; border-collapse: collapse; font-size: 9px; }}
+                .stmt-table td {{ padding: 5px 8px; border-bottom: 1px solid #e9ecef; vertical-align: middle; }}
+                .stmt-table .label {{ text-align: left; font-weight: 600; color: #495057; width: 55%; }}
+                .stmt-table .value {{ text-align: right; font-weight: 700; color: #212529; width: 45%; }}
+                .stmt-table .deduction {{ color: #c62828; }}
+                .stmt-table .addition {{ color: #2e7d32; }}
+                .stmt-table .total-row td {{ background: #e8eaf6; border-top: 2px solid #1a237e; font-size: 10px; }}
+                .stmt-table .grand-total td {{ background: #1a237e; color: white; font-size: 11px; font-weight: 700; }}
+                .stmt-table .grand-total .value {{ color: white; }}
+                .inv-table {{ width: 100%; border-collapse: collapse; font-size: 8px; margin-top: 10px; }}
+                .inv-table th {{ background: #1a237e; color: white; padding: 6px 4px; font-weight: 600; text-align: center; font-size: 7px; text-transform: uppercase; }}
+                .inv-table td {{ border: 1px solid #dee2e6; padding: 4px; text-align: center; }}
+                .inv-table .num {{ text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }}
+                .inv-table tr:nth-child(even) {{ background: #f8f9fa; }}
+                .badge {{ display: inline-block; padding: 1px 6px; border-radius: 10px; font-size: 7px; font-weight: 700; text-transform: uppercase; }}
+                .badge-success {{ background: #e8f5e9; color: #2e7d32; }}
+                .badge-info {{ background: #e3f2fd; color: #0277bd; }}
+                .badge-warning {{ background: #fff3e0; color: #f57c00; }}
+                .signature-section {{ margin-top: 30px; padding-top: 20px; border-top: 2px solid #1a237e; }}
+                .signature-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 40px; margin-top: 20px; }}
+                .sig-block {{ text-align: center; }}
+                .sig-line {{ border-top: 1px solid #333; margin-top: 50px; padding-top: 8px; font-size: 9px; font-weight: 600; }}
+                .amount-words {{ text-align: center; margin: 15px 0; padding: 10px; background: #f8f9fa; border-radius: 6px; font-size: 10px; font-weight: 600; color: #1a237e; }}
+                .amount-words.negative {{ color: #c62828; }}
+                .section-title {{ font-size: 11px; font-weight: 700; color: #1a237e; margin: 15px 0 8px 0; padding-bottom: 5px; border-bottom: 2px solid #1a237e; }}
+                .progress-bar {{ width: 100%; height: 20px; background: #e0e0e0; border-radius: 10px; overflow: hidden; margin: 8px 0; }}
+                .progress-fill {{ height: 100%; background: linear-gradient(90deg, #447e9b, #2e7d32); border-radius: 10px; display: flex; align-items: center; justify-content: flex-end; padding-right: 8px; color: white; font-size: 8px; font-weight: 700; }}
+                .excel-btn {{ display: inline-block; background: #217346; color: white; padding: 8px 16px; border-radius: 4px; text-decoration: none; font-size: 11px; font-weight: 600; margin-bottom: 15px; }}
+                .excel-btn:hover {{ background: #1e663f; }}
+                .vat-input-row {{ background: #e8f5e9; }}
+                .vat-input-row .label {{ color: #2e7d32; }}
+                .vat-input-row .value {{ color: #2e7d32; }}
+            </style></head>
+            <body>
+                <div class="page">
+                    <div class="logo-bar">{f'<img src="{logo_url}" alt="Logo">' if logo_url else ''}</div>
 
-            <!-- Excel Download Button -->
-            <div style="text-align: right; margin-bottom: 10px;">
-                <a href="?format=excel" class="excel-btn no-print">📊 Download Excel</a>
-            </div>
+                    <!-- Excel Download Button -->
+                    <div style="text-align: right; margin-bottom: 10px;">
+                        <a href="?format=excel" class="excel-btn no-print">📊 Download Excel</a>
+                    </div>
 
-            <div class="report-header">
-                <div class="report-title">Statement of Final Dues</div>
-                <div class="report-subtitle">Project: {proj.project_name} | Client: {proj.client.name}</div>
-            </div>
-            <div class="meta-grid">
-                <div class="meta-item"><div class="meta-label">Project Code</div><div class="meta-value">{proj.project_id_code}</div></div>
-                <div class="meta-item"><div class="meta-label">PO Number</div><div class="meta-value">{proj.po_number or 'N/A'}</div></div>
-                <div class="meta-item"><div class="meta-label">Report Date</div><div class="meta-value">{date.today().strftime('%d-%b-%Y')}</div></div>
-            </div>
-            <div class="two-col">
-                <div class="col-panel">
-                    <div class="col-header">CURRENT STATEMENT</div>
-                    <div class="col-body">
-                        <table class="stmt-table">
-                            <tr><td class="label">Original Contract Price</td><td class="value">{original_po:,.2f}</td></tr>
-                            <tr><td class="label">Amendments</td><td class="value">{amendments:,.2f}</td></tr>
-                            <tr><td class="label">Variations</td><td class="value">{variations:,.2f}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Final Contract Value</b></td><td class="value"><b>{final_contract_value:,.2f}</b></td></tr>
-                            <tr><td colspan="2" style="height:8px;"></td></tr>
-                            <tr><td class="label deduction">Materials Supplied by Client</td><td class="value deduction">{fmt_negative_label(total_materials)}</td></tr>
-                            <tr><td class="label deduction">Back Charges / Contra-Charges</td><td class="value deduction">{fmt_negative_label(back_charges)}</td></tr>
-                            <tr><td class="label deduction">Estimated Back Charges</td><td class="value deduction">{fmt_negative_label(estimated_back_charges)}</td></tr>
-                            <tr><td class="label deduction">Liquidated Damages</td><td class="value deduction">{fmt_negative_label(liquidated_damages)}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Net Amount Payable</b></td><td class="value"><b>{fmt_negative(net_payable)}</b></td></tr>
-                            <tr><td colspan="2" style="height:8px;"></td></tr>
-                            <tr><td class="label">Previously Paid (Advance)</td><td class="value">{fmt_negative_label(advance_paid)}</td></tr>
-                            <tr><td class="label">Previously Paid (Net of Materials)</td><td class="value">{fmt_negative_label(previously_paid_net)}</td></tr>
-                            <tr><td class="label deduction">Retention A ({ret_a_pct}%)</td><td class="value deduction">{fmt_negative_label(ret_a_cum)}</td></tr>
-                            <tr><td class="label deduction">Retention B ({ret_b_pct}%)</td><td class="value deduction">{fmt_negative_label(ret_b_cum)}</td></tr>
-                            <tr class="grand-total"><td class="label">TOTAL NET PAYABLE</td><td class="value">{fmt_grand_total(current_amount_payable)}</td></tr>
-                        </table>
-                        <div style="margin-top: 10px; padding: 8px; background: #f5f5f5; border-radius: 4px; font-size: 8px; color: #666;">
-                            <b>Progress:</b> {certified_work:,.2f} of {final_contract_value:,.2f} ({progress_pct:.1f}%)
+                    <div class="report-header">
+                        <div class="report-title">Statement of Final Dues</div>
+                        <div class="report-subtitle">Project: {proj.project_name} | Client: {proj.client.name}</div>
+                    </div>
+                    <div class="meta-grid">
+                        <div class="meta-item"><div class="meta-label">Project Code</div><div class="meta-value">{proj.project_id_code}</div></div>
+                        <div class="meta-item"><div class="meta-label">PO Number</div><div class="meta-value">{proj.po_number or 'N/A'}</div></div>
+                        <div class="meta-item"><div class="meta-label">Report Date</div><div class="meta-value">{date.today().strftime('%d-%b-%Y')}</div></div>
+                    </div>
+                    <div class="two-col">
+                        <div class="col-panel">
+                            <div class="col-header">CURRENT STATEMENT</div>
+                            <div class="col-body">
+                                <table class="stmt-table">
+                                    <tr><td class="label">Original Contract Price</td><td class="value">{original_po:,.2f}</td></tr>
+                                    <tr><td class="label">Amendments</td><td class="value">{amendments:,.2f}</td></tr>
+                                    <tr><td class="label">Variations</td><td class="value">{variations:,.2f}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Final Contract Value</b></td><td class="value"><b>{final_contract_value:,.2f}</b></td></tr>
+                                    <tr><td colspan="2" style="height:8px;"></td></tr>
+                                    <tr><td class="label deduction">Materials Supplied by Client</td><td class="value deduction">{fmt_negative_label(total_materials)}</td></tr>
+                                    <tr><td class="label deduction">Back Charges / Contra-Charges</td><td class="value deduction">{fmt_negative_label(back_charges)}</td></tr>
+                                    <tr><td class="label deduction">Estimated Back Charges</td><td class="value deduction">{fmt_negative_label(estimated_back_charges)}</td></tr>
+                                    <tr><td class="label deduction">Liquidated Damages</td><td class="value deduction">{fmt_negative_label(liquidated_damages)}</td></tr>
+                                    <tr><td class="label deduction">Client Deductions (Supplier Payments)</td><td class="value deduction">{fmt_negative_label(client_deductions_total)}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Net Amount Payable</b></td><td class="value"><b>{fmt_negative(net_payable)}</b></td></tr>
+                                    <tr><td colspan="2" style="height:8px;"></td></tr>
+                                    <tr><td class="label">Previously Paid (Advance)</td><td class="value">{fmt_negative_label(advance_paid)}</td></tr>
+                                    <tr><td class="label">Previously Paid (Net of Materials)</td><td class="value">{fmt_negative_label(previously_paid_net)}</td></tr>
+                                    <tr><td class="label deduction">Retention A ({ret_a_pct}%)</td><td class="value deduction">{fmt_negative_label(ret_a_cum)}</td></tr>
+                                    <tr><td class="label deduction">Retention B ({ret_b_pct}%)</td><td class="value deduction">{fmt_negative_label(ret_b_cum)}</td></tr>
+                                    <tr class="vat-input-row"><td class="label"><b>VAT Input on Client Deductions ({vat_rate}%)</b></td><td class="value"><b>{client_deductions_vat_input:,.2f}</b></td></tr>
+                                    <tr class="grand-total"><td class="label">TOTAL NET PAYABLE</td><td class="value">{fmt_grand_total(current_amount_payable)}</td></tr>
+                                </table>
+                                <div style="margin-top: 10px; padding: 8px; background: #f5f5f5; border-radius: 4px; font-size: 8px; color: #666;">
+                                    <b>Progress:</b> {certified_work:,.2f} of {final_contract_value:,.2f} ({progress_pct:.1f}%)
+                                </div>
+                                <div class="progress-bar"><div class="progress-fill" style="width: {min(float(progress_pct), 100)}%;">{progress_pct:.1f}%</div></div>
+                            </div>
                         </div>
-                        <div class="progress-bar"><div class="progress-fill" style="width: {min(float(progress_pct), 100)}%;">{progress_pct:.1f}%</div></div>
+                        <div class="col-panel">
+                            <div class="col-header completed">IF PROJECT COMPLETED</div>
+                            <div class="col-body">
+                                <table class="stmt-table">
+                                    <tr><td class="label">Original Contract Price</td><td class="value">{original_po:,.2f}</td></tr>
+                                    <tr><td class="label">Amendments</td><td class="value">{amendments:,.2f}</td></tr>
+                                    <tr><td class="label">Variations</td><td class="value">{variations:,.2f}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Final Contract Value</b></td><td class="value"><b>{final_contract_value:,.2f}</b></td></tr>
+                                    <tr><td colspan="2" style="height:8px;"></td></tr>
+                                    <tr><td class="label deduction">Materials Supplied by Client</td><td class="value deduction">{fmt_negative_label(total_materials)}</td></tr>
+                                    <tr><td class="label deduction">Back Charges / Contra-Charges</td><td class="value deduction">{fmt_negative_label(back_charges)}</td></tr>
+                                    <tr><td class="label deduction">Estimated Back Charges</td><td class="value deduction">{fmt_negative_label(estimated_back_charges)}</td></tr>
+                                    <tr><td class="label deduction">Liquidated Damages</td><td class="value deduction">{fmt_negative_label(liquidated_damages)}</td></tr>
+                                    <tr><td class="label deduction">Client Deductions (Supplier Payments)</td><td class="value deduction">{fmt_negative_label(client_deductions_total)}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Net Amount Payable</b></td><td class="value"><b>{fmt_negative(net_payable)}</b></td></tr>
+                                    <tr><td colspan="2" style="height:8px;"></td></tr>
+                                    <tr><td class="label">Previously Paid (Advance)</td><td class="value">{fmt_negative_label(advance_paid)}</td></tr>
+                                    <tr><td class="label">Previously Paid (Net of Materials)</td><td class="value">{fmt_negative_label(previously_paid_net)}</td></tr>
+                                    <tr><td class="label deduction">Retention A ({ret_a_pct}%)</td><td class="value deduction">{fmt_negative_label(completed_ret_a)}</td></tr>
+                                    <tr><td class="label deduction">Retention B ({ret_b_pct}%)</td><td class="value deduction">{fmt_negative_label(completed_ret_b)}</td></tr>
+                                    <tr class="vat-input-row"><td class="label"><b>VAT Input on Client Deductions ({vat_rate}%)</b></td><td class="value"><b>{client_deductions_vat_input:,.2f}</b></td></tr>
+                                    <tr class="grand-total"><td class="label">TOTAL NET PAYABLE</td><td class="value">{fmt_grand_total(completed_amount_payable)}</td></tr>
+                                </table>
+                                <div style="margin-top: 10px; padding: 8px; background: #e8f5e9; border-radius: 4px; font-size: 8px; color: #2e7d32;"><b>100% Complete</b> — Full contract value realized</div>
+                                <div class="progress-bar"><div class="progress-fill" style="width: 100%;">100%</div></div>
+                            </div>
+                        </div>
                     </div>
-                </div>
-                <div class="col-panel">
-                    <div class="col-header completed">IF PROJECT COMPLETED</div>
-                    <div class="col-body">
-                        <table class="stmt-table">
-                            <tr><td class="label">Original Contract Price</td><td class="value">{original_po:,.2f}</td></tr>
-                            <tr><td class="label">Amendments</td><td class="value">{amendments:,.2f}</td></tr>
-                            <tr><td class="label">Variations</td><td class="value">{variations:,.2f}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Final Contract Value</b></td><td class="value"><b>{final_contract_value:,.2f}</b></td></tr>
-                            <tr><td colspan="2" style="height:8px;"></td></tr>
-                            <tr><td class="label deduction">Materials Supplied by Client</td><td class="value deduction">{fmt_negative_label(total_materials)}</td></tr>
-                            <tr><td class="label deduction">Back Charges / Contra-Charges</td><td class="value deduction">{fmt_negative_label(back_charges)}</td></tr>
-                            <tr><td class="label deduction">Estimated Back Charges</td><td class="value deduction">{fmt_negative_label(estimated_back_charges)}</td></tr>
-                            <tr><td class="label deduction">Liquidated Damages</td><td class="value deduction">{fmt_negative_label(liquidated_damages)}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Net Amount Payable</b></td><td class="value"><b>{fmt_negative(net_payable)}</b></td></tr>
-                            <tr><td colspan="2" style="height:8px;"></td></tr>
-                            <tr><td class="label">Previously Paid (Advance)</td><td class="value">{fmt_negative_label(advance_paid)}</td></tr>
-                            <tr><td class="label">Previously Paid (Net of Materials)</td><td class="value">{fmt_negative_label(previously_paid_net)}</td></tr>
-                            <tr><td class="label deduction">Retention A ({ret_a_pct}%)</td><td class="value deduction">{fmt_negative_label(completed_ret_a)}</td></tr>
-                            <tr><td class="label deduction">Retention B ({ret_b_pct}%)</td><td class="value deduction">{fmt_negative_label(completed_ret_b)}</td></tr>
-                            <tr class="grand-total"><td class="label">TOTAL NET PAYABLE</td><td class="value">{fmt_grand_total(completed_amount_payable)}</td></tr>
-                        </table>
-                        <div style="margin-top: 10px; padding: 8px; background: #e8f5e9; border-radius: 4px; font-size: 8px; color: #2e7d32;"><b>100% Complete</b> — Full contract value realized</div>
-                        <div class="progress-bar"><div class="progress-fill" style="width: 100%;">100%</div></div>
+                    <div class="section-title">Retention Summary</div>
+                    <div class="two-col" style="margin-bottom: 15px;">
+                        <div class="col-panel">
+                            <div class="col-header">CURRENT RETENTION STATUS</div>
+                            <div class="col-body">
+                                <table class="stmt-table">
+                                    <tr><td class="label">Retention A Deducted (Cum)</td><td class="value">{ret_a_cum:,.2f}</td></tr>
+                                    <tr><td class="label">Retention A Recovered</td><td class="value addition">{fmt_negative_label(ret_a_rec)}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Retention A Held</b></td><td class="value"><b>{fmt_negative(ret_a_cum - ret_a_rec)}</b></td></tr>
+                                    <tr><td colspan="2" style="height:5px;"></td></tr>
+                                    <tr><td class="label">Retention B Deducted (Cum)</td><td class="value">{ret_b_cum:,.2f}</td></tr>
+                                    <tr><td class="label">Retention B Recovered</td><td class="value addition">{fmt_negative_label(ret_b_rec)}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Retention B Held</b></td><td class="value"><b>{fmt_negative(ret_b_cum - ret_b_rec)}</b></td></tr>
+                                    <tr><td colspan="2" style="height:5px;"></td></tr>
+                                    <tr class="grand-total"><td class="label">TOTAL RETENTION HELD</td><td class="value">{fmt_grand_total(total_retention_held)}</td></tr>
+                                </table>
+                            </div>
+                        </div>
+                        <div class="col-panel">
+                            <div class="col-header completed">UPON PROJECT COMPLETION</div>
+                            <div class="col-body">
+                                <table class="stmt-table">
+                                    <tr><td class="label">Retention A ({ret_a_pct}% of contract)</td><td class="value">{completed_ret_a:,.2f}</td></tr>
+                                    <tr><td class="label">Retention A Already Recovered</td><td class="value addition">{fmt_negative_label(ret_a_rec)}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Retention A Remaining</b></td><td class="value"><b>{fmt_negative(completed_ret_a - ret_a_rec)}</b></td></tr>
+                                    <tr><td colspan="2" style="height:5px;"></td></tr>
+                                    <tr><td class="label">Retention B ({ret_b_pct}% of contract)</td><td class="value">{completed_ret_b:,.2f}</td></tr>
+                                    <tr><td class="label">Retention B Already Recovered</td><td class="value addition">{fmt_negative_label(ret_b_rec)}</td></tr>
+                                    <tr class="total-row"><td class="label"><b>Retention B Remaining</b></td><td class="value"><b>{fmt_negative(completed_ret_b - ret_b_rec)}</b></td></tr>
+                                    <tr><td colspan="2" style="height:5px;"></td></tr>
+                                    <tr class="grand-total"><td class="label">TOTAL RETENTION TO RECOVER</td><td class="value">{fmt_grand_total(completed_retention - total_retention_deducted + total_retention_held)}</td></tr>
+                                </table>
+                            </div>
+                        </div>
                     </div>
-                </div>
-            </div>
-            <div class="section-title">Retention Summary</div>
-            <div class="two-col" style="margin-bottom: 15px;">
-                <div class="col-panel">
-                    <div class="col-header">CURRENT RETENTION STATUS</div>
-                    <div class="col-body">
-                        <table class="stmt-table">
-                            <tr><td class="label">Retention A Deducted (Cum)</td><td class="value">{ret_a_cum:,.2f}</td></tr>
-                            <tr><td class="label">Retention A Recovered</td><td class="value addition">{fmt_negative_label(ret_a_rec)}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Retention A Held</b></td><td class="value"><b>{fmt_negative(ret_a_cum - ret_a_rec)}</b></td></tr>
-                            <tr><td colspan="2" style="height:5px;"></td></tr>
-                            <tr><td class="label">Retention B Deducted (Cum)</td><td class="value">{ret_b_cum:,.2f}</td></tr>
-                            <tr><td class="label">Retention B Recovered</td><td class="value addition">{fmt_negative_label(ret_b_rec)}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Retention B Held</b></td><td class="value"><b>{fmt_negative(ret_b_cum - ret_b_rec)}</b></td></tr>
-                            <tr><td colspan="2" style="height:5px;"></td></tr>
-                            <tr class="grand-total"><td class="label">TOTAL RETENTION HELD</td><td class="value">{fmt_grand_total(total_retention_held)}</td></tr>
-                        </table>
+                    <div class="section-title">Tax Invoice History (Excl. VAT)</div>
+                    <table class="inv-table">
+                        <thead><tr><th>Invoice #</th><th>Date</th><th>Status</th><th>Cum. Work</th><th>Prev. Work</th><th>Current Net</th><th>Ret A</th><th>Ret B</th><th>Adv Rec</th><th>Payable</th></tr></thead>
+                        <tbody>{inv_rows if inv_rows else '<tr><td colspan="10" style="text-align:center; color:#999; padding:20px;">No tax invoices found</td></tr>'}</tbody>
+                        <tfoot><tr style="background: #e8eaf6; font-weight: bold; border-top: 2px solid #1a237e;">
+                            <td colspan="3"><b>TOTALS</b></td>
+                            <td class="num">{certified_work:,.2f}</td>
+                            <td class="num">—</td>
+                            <td class="num">{sum((inv.current_certified_net_before_vat or Decimal("0")) for inv in invoices):,.2f}</td>
+                            <td class="num">{fmt_negative_label(ret_a_cum)}</td>
+                            <td class="num">{fmt_negative_label(ret_b_cum)}</td>
+                            <td class="num">{fmt_negative_label(latest_inv.cumulative_advance_recovered if latest_inv else Decimal("0"))}</td>
+                            <td class="num">{sum((inv.total_after_vat or Decimal("0")) for inv in invoices):,.2f}</td>
+                        </tr></tfoot>
+                    </table>
+                    <div class="amount-words {'negative' if current_amount_payable < 0 else ''}">
+                        Amount in Words: AED {fmt_negative_plain(current_amount_payable)} Dirhams Only
                     </div>
-                </div>
-                <div class="col-panel">
-                    <div class="col-header completed">UPON PROJECT COMPLETION</div>
-                    <div class="col-body">
-                        <table class="stmt-table">
-                            <tr><td class="label">Retention A ({ret_a_pct}% of contract)</td><td class="value">{completed_ret_a:,.2f}</td></tr>
-                            <tr><td class="label">Retention A Already Recovered</td><td class="value addition">{fmt_negative_label(ret_a_rec)}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Retention A Remaining</b></td><td class="value"><b>{fmt_negative(completed_ret_a - ret_a_rec)}</b></td></tr>
-                            <tr><td colspan="2" style="height:5px;"></td></tr>
-                            <tr><td class="label">Retention B ({ret_b_pct}% of contract)</td><td class="value">{completed_ret_b:,.2f}</td></tr>
-                            <tr><td class="label">Retention B Already Recovered</td><td class="value addition">{fmt_negative_label(ret_b_rec)}</td></tr>
-                            <tr class="total-row"><td class="label"><b>Retention B Remaining</b></td><td class="value"><b>{fmt_negative(completed_ret_b - ret_b_rec)}</b></td></tr>
-                            <tr><td colspan="2" style="height:5px;"></td></tr>
-                            <tr class="grand-total"><td class="label">TOTAL RETENTION TO RECOVER</td><td class="value">{fmt_grand_total(completed_retention - total_retention_deducted + total_retention_held)}</td></tr>
-                        </table>
+                    <div class="signature-section">
+                        <div style="text-align: center; font-size: 10px; margin-bottom: 15px; color: #1a237e; font-weight: 700;">CERTIFICATION</div>
+                        <div style="font-size: 9px; line-height: 1.6; margin-bottom: 20px; text-align: center;">
+                            We, <b>{company.company_name if company else "—"}</b> hereby confirm that the final amount due, 
+                            <b>AED {fmt_negative(current_amount_payable)}</b> is the full and final settlement due to us against the captioned Project.
+                            <br>We further confirm that upon payment of the Final Amount due, the Client shall have honored all of its obligations under this Contract.
+                        </div>
+                        <div class="signature-grid">
+                            <div class="sig-block"><div class="sig-line">For Contractor</div><div style="font-size: 8px; color: #666; margin-top: 4px;">Name & Title</div></div>
+                            <div class="sig-block"><div class="sig-line">For Client</div><div style="font-size: 8px; color: #666; margin-top: 4px;">Name & Title</div></div>
+                        </div>
                     </div>
+                    <script>window.onload = function() {{ window.print(); }}</script>
                 </div>
-            </div>
-            <div class="section-title">Tax Invoice History (Excl. VAT)</div>
-            <table class="inv-table">
-                <thead><tr><th>Invoice #</th><th>Date</th><th>Status</th><th>Cum. Work</th><th>Prev. Work</th><th>Current Net</th><th>Ret A</th><th>Ret B</th><th>Adv Rec</th><th>Payable</th></tr></thead>
-                <tbody>{inv_rows if inv_rows else '<tr><td colspan="10" style="text-align:center; color:#999; padding:20px;">No tax invoices found</td></tr>'}</tbody>
-                <tfoot><tr style="background: #e8eaf6; font-weight: bold; border-top: 2px solid #1a237e;">
-                    <td colspan="3"><b>TOTALS</b></td>
-                    <td class="num">{certified_work:,.2f}</td>
-                    <td class="num">—</td>
-                    <td class="num">{sum((inv.current_certified_net_before_vat or Decimal("0")) for inv in invoices):,.2f}</td>
-                    <td class="num">{fmt_negative_label(ret_a_cum)}</td>
-                    <td class="num">{fmt_negative_label(ret_b_cum)}</td>
-                    <td class="num">{fmt_negative_label(latest_inv.cumulative_advance_recovered if latest_inv else Decimal("0"))}</td>
-                    <td class="num">{sum((inv.total_after_vat or Decimal("0")) for inv in invoices):,.2f}</td>
-                </tr></tfoot>
-            </table>
-            <div class="amount-words {'negative' if current_amount_payable < 0 else ''}">
-                Amount in Words: AED {fmt_negative_plain(current_amount_payable)} Dirhams Only
-            </div>
-            <div class="signature-section">
-                <div style="text-align: center; font-size: 10px; margin-bottom: 15px; color: #1a237e; font-weight: 700;">CERTIFICATION</div>
-                <div style="font-size: 9px; line-height: 1.6; margin-bottom: 20px; text-align: center;">
-                    We, <b>{company.company_name if company else "PROCON GENERAL CONTRACTING L.L.C"}</b> hereby confirm that the final amount due, 
-                    <b>AED {fmt_negative(current_amount_payable)}</b> is the full and final settlement due to us against the captioned Project.
-                    <br>We further confirm that upon payment of the Final Amount due, the Client shall have honored all of its obligations under this Contract.
-                </div>
-                <div class="signature-grid">
-                    <div class="sig-block"><div class="sig-line">For Contractor</div><div style="font-size: 8px; color: #666; margin-top: 4px;">Name & Title</div></div>
-                    <div class="sig-block"><div class="sig-line">For Client</div><div style="font-size: 8px; color: #666; margin-top: 4px;">Name & Title</div></div>
-                </div>
-            </div>
-            <script>window.onload = function() {{ window.print(); }}</script>
-        </div>
-    </body></html>"""
-            return HttpResponse(html)
+            </body></html>"""
+        return HttpResponse(html)
 
     def _project_statement_excel(self, request, proj, company):
-            """Generate Excel version of the project statement."""
-            import io
-            from openpyxl import Workbook
-            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, numbers
-            from openpyxl.utils import get_column_letter
+        """Generate Excel version of the project statement."""
+        import io
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side, numbers
+        from openpyxl.utils import get_column_letter
 
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Project Statement"
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Project Statement"
 
-            # Styles
-            header_fill = PatternFill(start_color="1A237E", end_color="1A237E", fill_type="solid")
-            header_font = Font(bold=True, color="FFFFFF", size=11)
-            subheader_fill = PatternFill(start_color="E8EAF6", end_color="E8EAF6", fill_type="solid")
-            subheader_font = Font(bold=True, color="1A237E", size=10)
-            grand_fill = PatternFill(start_color="1A237E", end_color="1A237E", fill_type="solid")
-            grand_font = Font(bold=True, color="FFFFFF", size=11)
-            deduction_font = Font(color="C62828")
-            bold_font = Font(bold=True)
-            center_align = Alignment(horizontal="center", vertical="center")
-            right_align = Alignment(horizontal="right", vertical="center")
-            thin_border = Border(
-                bottom=Side(style='thin', color='CCCCCC')
-            )
+        # Styles
+        header_fill = PatternFill(start_color="1A237E", end_color="1A237E", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=11)
+        subheader_fill = PatternFill(start_color="E8EAF6", end_color="E8EAF6", fill_type="solid")
+        subheader_font = Font(bold=True, color="1A237E", size=10)
+        grand_fill = PatternFill(start_color="1A237E", end_color="1A237E", fill_type="solid")
+        grand_font = Font(bold=True, color="FFFFFF", size=11)
+        deduction_font = Font(color="C62828")
+        addition_font = Font(color="2E7D32")
+        bold_font = Font(bold=True)
+        center_align = Alignment(horizontal="center", vertical="center")
+        right_align = Alignment(horizontal="right", vertical="center")
+        thin_border = Border(
+            bottom=Side(style='thin', color='CCCCCC')
+        )
 
-            # Helper to format numbers
-            def fmt(val):
-                return float(val) if val else 0.0
+        # Helper to format numbers
+        def fmt(val):
+            return float(val) if val else 0.0
 
-            # --- HEADER ---
-            ws.merge_cells('A1:D1')
-            ws['A1'] = "STATEMENT OF FINAL DUES"
-            ws['A1'].font = Font(bold=True, size=16, color="1A237E")
-            ws['A1'].alignment = center_align
+        # --- HEADER ---
+        ws.merge_cells('A1:D1')
+        ws['A1'] = "STATEMENT OF FINAL DUES"
+        ws['A1'].font = Font(bold=True, size=16, color="1A237E")
+        ws['A1'].alignment = center_align
 
-            ws.merge_cells('A2:D2')
-            ws['A2'] = f"Project: {proj.project_name}"
-            ws['A2'].alignment = center_align
+        ws.merge_cells('A2:D2')
+        ws['A2'] = f"Project: {proj.project_name}"
+        ws['A2'].alignment = center_align
 
-            ws.merge_cells('A3:D3')
-            ws[
-                'A3'] = f"Client: {proj.client.name} | PO: {proj.po_number or 'N/A'} | Date: {date.today().strftime('%d-%b-%Y')}"
-            ws['A3'].alignment = center_align
-            ws.row_dimensions[3].height = 25
+        ws.merge_cells('A3:D3')
+        ws[
+            'A3'] = f"Client: {proj.client.name} | PO: {proj.po_number or 'N/A'} | Date: {date.today().strftime('%d-%b-%Y')}"
+        ws['A3'].alignment = center_align
+        ws.row_dimensions[3].height = 25
 
-            row = 5
+        row = 5
 
-            # --- CURRENT STATEMENT COLUMN ---
-            ws.merge_cells(f'A{row}:B{row}')
-            ws[f'A{row}'] = "CURRENT STATEMENT"
-            ws[f'A{row}'].fill = header_fill
-            ws[f'A{row}'].font = header_font
-            ws[f'A{row}'].alignment = center_align
-            ws.merge_cells(f'C{row}:D{row}')
-            ws[f'C{row}'] = "IF PROJECT COMPLETED"
-            ws[f'C{row}'].fill = PatternFill(start_color="00695C", end_color="00695C", fill_type="solid")
-            ws[f'C{row}'].font = header_font
-            ws[f'C{row}'].alignment = center_align
-            row += 1
+        # --- CURRENT STATEMENT COLUMN ---
+        ws.merge_cells(f'A{row}:B{row}')
+        ws[f'A{row}'] = "CURRENT STATEMENT"
+        ws[f'A{row}'].fill = header_fill
+        ws[f'A{row}'].font = header_font
+        ws[f'A{row}'].alignment = center_align
+        ws.merge_cells(f'C{row}:D{row}')
+        ws[f'C{row}'] = "IF PROJECT COMPLETED"
+        ws[f'C{row}'].fill = PatternFill(start_color="00695C", end_color="00695C", fill_type="solid")
+        ws[f'C{row}'].font = header_font
+        ws[f'C{row}'].alignment = center_align
+        row += 1
 
-            # Fetch data
-            invoices = Invoice.objects.filter(project=proj, inv_type='T').exclude(is_advance_invoice=True).order_by(
-                'inv_number')
-            latest_inv = invoices.order_by('-inv_number').first()
+        # Fetch data
+        invoices = Invoice.objects.filter(project=proj, inv_type='T').exclude(is_advance_invoice=True).order_by(
+            'inv_number')
+        latest_inv = invoices.order_by('-inv_number').first()
 
-            original_po = proj.po_amount
-            amendments = getattr(proj, 'amendment_amount', Decimal("0"))
-            variations = getattr(proj, 'variation_amount', Decimal("0"))
-            final_contract_value = original_po + amendments + variations
-            certified_work = latest_inv.cumulative_work_done if latest_inv else Decimal("0")
-            total_materials = sum((inv.material_supplied_by_client or Decimal("0")) for inv in invoices)
-            back_charges = getattr(proj, 'back_charges', Decimal("0"))
-            estimated_back_charges = getattr(proj, 'estimated_back_charges', Decimal("0"))
-            liquidated_damages = getattr(proj, 'liquidated_damages', Decimal("0"))
-            net_payable = final_contract_value - total_materials - back_charges - estimated_back_charges - liquidated_damages
+        original_po = proj.po_amount
+        amendments = getattr(proj, 'amendment_amount', Decimal("0"))
+        variations = getattr(proj, 'variation_amount', Decimal("0"))
+        final_contract_value = original_po + amendments + variations
+        certified_work = latest_inv.cumulative_work_done if latest_inv else Decimal("0")
+        total_materials = sum((inv.material_supplied_by_client or Decimal("0")) for inv in invoices)
+        back_charges = getattr(proj, 'back_charges', Decimal("0"))
+        estimated_back_charges = getattr(proj, 'estimated_back_charges', Decimal("0"))
+        liquidated_damages = getattr(proj, 'liquidated_damages', Decimal("0"))
 
-            paid_invoices = invoices.filter(status='Paid')
-            previously_paid = sum((inv.current_certified_net_before_vat or Decimal("0")) for inv in paid_invoices)
-            advance_paid = getattr(proj, 'advance_paid', Decimal("0"))
+        # Client deductions
+        client_deductions_total = ClientDeduction.objects.filter(
+            project=proj, invoice__in=invoices
+        ).aggregate(total=Sum('amount'))['total'] or Decimal("0")
+        vat_rate = Decimal("5")
+        client_deductions_vat_input = money(client_deductions_total * vat_rate / Decimal("100"))
 
-            ret_a_pct = proj.retention_a_percent or Decimal("0")
-            ret_b_pct = proj.retention_b_percent or Decimal("0")
-            ret_a_cum = latest_inv.cumulative_retention_a if latest_inv else Decimal("0")
-            ret_b_cum = latest_inv.cumulative_retention_b if latest_inv else Decimal("0")
-            ret_a_rec = latest_inv.cumulative_retention_a_recovered if latest_inv else Decimal("0")
-            ret_b_rec = latest_inv.cumulative_retention_b_recovered if latest_inv else Decimal("0")
-            total_retention_held = (ret_a_cum + ret_b_cum) - (ret_a_rec + ret_b_rec)
-            total_retention_deducted = ret_a_cum + ret_b_cum
+        net_payable = final_contract_value - total_materials - back_charges - estimated_back_charges - liquidated_damages - client_deductions_total
 
-            completed_ret_a = final_contract_value * ret_a_pct / Decimal("100")
-            completed_ret_b = final_contract_value * ret_b_pct / Decimal("100")
-            completed_retention = completed_ret_a + completed_ret_b
+        paid_invoices = invoices.filter(status='Paid')
+        previously_paid = sum((inv.current_certified_net_before_vat or Decimal("0")) for inv in paid_invoices)
+        advance_paid = getattr(proj, 'advance_paid', Decimal("0"))
 
-            current_amount_payable = certified_work - total_materials - total_retention_held - previously_paid - advance_paid
-            completed_amount_payable = final_contract_value - total_materials - completed_retention - previously_paid - advance_paid
+        ret_a_pct = proj.retention_a_percent or Decimal("0")
+        ret_b_pct = proj.retention_b_percent or Decimal("0")
+        ret_a_cum = latest_inv.cumulative_retention_a if latest_inv else Decimal("0")
+        ret_b_cum = latest_inv.cumulative_retention_b if latest_inv else Decimal("0")
+        ret_a_rec = latest_inv.cumulative_retention_a_recovered if latest_inv else Decimal("0")
+        ret_b_rec = latest_inv.cumulative_retention_b_recovered if latest_inv else Decimal("0")
+        total_retention_held = (ret_a_cum + ret_b_cum) - (ret_a_rec + ret_b_rec)
+        total_retention_deducted = ret_a_cum + ret_b_cum
 
-            # Data rows
-            data_rows = [
-                ("Original Contract Price", original_po, original_po),
-                ("Amendments", amendments, amendments),
-                ("Variations", variations, variations),
-                ("FINAL CONTRACT VALUE", final_contract_value, final_contract_value),
-                ("", "", ""),
-                ("Materials Supplied by Client", -total_materials, -total_materials),
-                ("Back Charges / Contra-Charges", -back_charges, -back_charges),
-                ("Estimated Back Charges", -estimated_back_charges, -estimated_back_charges),
-                ("Liquidated Damages", -liquidated_damages, -liquidated_damages),
-                ("NET AMOUNT PAYABLE", net_payable, net_payable),
-                ("", "", ""),
-                ("Previously Paid (Advance)", -advance_paid, -advance_paid),
-                ("Previously Paid (Net)", -previously_paid, -previously_paid),
-                (f"Retention A ({ret_a_pct}%)", -ret_a_cum, -completed_ret_a),
-                (f"Retention B ({ret_b_pct}%)", -ret_b_cum, -completed_ret_b),
-                ("TOTAL NET PAYABLE", current_amount_payable, completed_amount_payable),
-            ]
+        completed_ret_a = final_contract_value * ret_a_pct / Decimal("100")
+        completed_ret_b = final_contract_value * ret_b_pct / Decimal("100")
+        completed_retention = completed_ret_a + completed_ret_b
 
-            for label, current_val, completed_val in data_rows:
-                if label == "":
-                    row += 1
-                    continue
+        current_amount_payable = net_payable - total_retention_held - previously_paid - advance_paid + client_deductions_vat_input
+        completed_amount_payable = net_payable - completed_retention - previously_paid - advance_paid + client_deductions_vat_input
 
-                is_total = label in ["FINAL CONTRACT VALUE", "NET AMOUNT PAYABLE", "TOTAL NET PAYABLE"]
-                is_deduction = current_val < 0 and label not in ["TOTAL NET PAYABLE", "NET AMOUNT PAYABLE",
-                                                                 "FINAL CONTRACT VALUE"]
+        # Data rows
+        data_rows = [
+            ("Original Contract Price", original_po, original_po),
+            ("Amendments", amendments, amendments),
+            ("Variations", variations, variations),
+            ("FINAL CONTRACT VALUE", final_contract_value, final_contract_value),
+            ("", "", ""),
+            ("Materials Supplied by Client", -total_materials, -total_materials),
+            ("Back Charges / Contra-Charges", -back_charges, -back_charges),
+            ("Estimated Back Charges", -estimated_back_charges, -estimated_back_charges),
+            ("Liquidated Damages", -liquidated_damages, -liquidated_damages),
+            ("Client Deductions (Supplier Payments)", -client_deductions_total, -client_deductions_total),
+            ("NET AMOUNT PAYABLE", net_payable, net_payable),
+            ("", "", ""),
+            ("Previously Paid (Advance)", -advance_paid, -advance_paid),
+            ("Previously Paid (Net)", -previously_paid, -previously_paid),
+            (f"Retention A ({ret_a_pct}%)", -ret_a_cum, -completed_ret_a),
+            (f"Retention B ({ret_b_pct}%)", -ret_b_cum, -completed_ret_b),
+            (f"VAT Input on Client Deductions ({vat_rate}%)", client_deductions_vat_input, client_deductions_vat_input),
+            ("TOTAL NET PAYABLE", current_amount_payable, completed_amount_payable),
+        ]
 
-                ws[f'A{row}'] = label
-                ws[f'A{row}'].font = bold_font if is_total else (deduction_font if is_deduction else Font())
-                ws[f'A{row}'].border = thin_border
-
-                ws[f'B{row}'] = fmt(current_val)
-                ws[f'B{row}'].number_format = '#,##0.00'
-                ws[f'B{row}'].alignment = right_align
-                ws[f'B{row}'].font = bold_font if is_total else (deduction_font if is_deduction else Font())
-                ws[f'B{row}'].border = thin_border
-                if is_total:
-                    ws[f'A{row}'].fill = subheader_fill
-                    ws[f'B{row}'].fill = subheader_fill
-
-                ws[f'C{row}'] = label
-                ws[f'C{row}'].font = bold_font if is_total else (deduction_font if is_deduction else Font())
-                ws[f'C{row}'].border = thin_border
-
-                ws[f'D{row}'] = fmt(completed_val)
-                ws[f'D{row}'].number_format = '#,##0.00'
-                ws[f'D{row}'].alignment = right_align
-                ws[f'D{row}'].font = bold_font if is_total else (deduction_font if is_deduction else Font())
-                ws[f'D{row}'].border = thin_border
-                if is_total:
-                    ws[f'C{row}'].fill = subheader_fill
-                    ws[f'D{row}'].fill = subheader_fill
-
+        for label, current_val, completed_val in data_rows:
+            if label == "":
                 row += 1
+                continue
 
-            # Grand total row - DON'T merge, just write to individual cells
-            ws[f'A{row}'] = "TOTAL NET PAYABLE"
-            ws[f'A{row}'].fill = grand_fill
-            ws[f'A{row}'].font = grand_font
-            ws[f'A{row}'].alignment = center_align
-            ws[f'B{row}'] = fmt(current_amount_payable)
+            is_total = label in ["FINAL CONTRACT VALUE", "NET AMOUNT PAYABLE", "TOTAL NET PAYABLE"]
+            is_deduction = current_val < 0 and label not in ["TOTAL NET PAYABLE", "NET AMOUNT PAYABLE",
+                                                             "FINAL CONTRACT VALUE"]
+            is_addition = "VAT Input" in label
+
+            ws[f'A{row}'] = label
+            if is_total:
+                ws[f'A{row}'].font = bold_font
+                ws[f'A{row}'].fill = subheader_fill
+            elif is_deduction:
+                ws[f'A{row}'].font = deduction_font
+            elif is_addition:
+                ws[f'A{row}'].font = addition_font
+            ws[f'A{row}'].border = thin_border
+
+            ws[f'B{row}'] = fmt(current_val)
             ws[f'B{row}'].number_format = '#,##0.00'
             ws[f'B{row}'].alignment = right_align
-            ws[f'B{row}'].fill = grand_fill
-            ws[f'B{row}'].font = grand_font
+            if is_total:
+                ws[f'B{row}'].font = bold_font
+                ws[f'B{row}'].fill = subheader_fill
+            elif is_deduction:
+                ws[f'B{row}'].font = deduction_font
+            elif is_addition:
+                ws[f'B{row}'].font = addition_font
+            ws[f'B{row}'].border = thin_border
 
-            ws[f'C{row}'] = "TOTAL NET PAYABLE (COMPLETED)"
-            ws[f'C{row}'].fill = grand_fill
-            ws[f'C{row}'].font = grand_font
-            ws[f'C{row}'].alignment = center_align
-            ws[f'D{row}'] = fmt(completed_amount_payable)
+            ws[f'C{row}'] = label
+            if is_total:
+                ws[f'C{row}'].font = bold_font
+                ws[f'C{row}'].fill = subheader_fill
+            elif is_deduction:
+                ws[f'C{row}'].font = deduction_font
+            elif is_addition:
+                ws[f'C{row}'].font = addition_font
+            ws[f'C{row}'].border = thin_border
+
+            ws[f'D{row}'] = fmt(completed_val)
             ws[f'D{row}'].number_format = '#,##0.00'
             ws[f'D{row}'].alignment = right_align
-            ws[f'D{row}'].fill = grand_fill
-            ws[f'D{row}'].font = grand_font
-            row += 2
+            if is_total:
+                ws[f'D{row}'].font = bold_font
+                ws[f'D{row}'].fill = subheader_fill
+            elif is_deduction:
+                ws[f'D{row}'].font = deduction_font
+            elif is_addition:
+                ws[f'D{row}'].font = addition_font
+            ws[f'D{row}'].border = thin_border
 
-            # --- INVOICE HISTORY ---
-            ws.merge_cells(f'A{row}:D{row}')
-            ws[f'A{row}'] = "TAX INVOICE HISTORY (Excl. VAT)"
-            ws[f'A{row}'].fill = header_fill
-            ws[f'A{row}'].font = header_font
-            ws[f'A{row}'].alignment = center_align
             row += 1
 
-            # Invoice headers
-            inv_headers = ["Invoice #", "Date", "Status", "Cum. Work", "Prev. Work", "Current Net", "Ret A", "Ret B",
-                           "Adv Rec", "Payable"]
-            for col_idx, header in enumerate(inv_headers, 1):
-                cell = ws.cell(row=row, column=col_idx, value=header)
-                cell.fill = subheader_fill
-                cell.font = subheader_font
-                cell.alignment = center_align
-                cell.border = thin_border
+        # Grand total row
+        ws[f'A{row}'] = "TOTAL NET PAYABLE"
+        ws[f'A{row}'].fill = grand_fill
+        ws[f'A{row}'].font = grand_font
+        ws[f'A{row}'].alignment = center_align
+        ws[f'B{row}'] = fmt(current_amount_payable)
+        ws[f'B{row}'].number_format = '#,##0.00'
+        ws[f'B{row}'].alignment = right_align
+        ws[f'B{row}'].fill = grand_fill
+        ws[f'B{row}'].font = grand_font
+
+        ws[f'C{row}'] = "TOTAL NET PAYABLE (COMPLETED)"
+        ws[f'C{row}'].fill = grand_fill
+        ws[f'C{row}'].font = grand_font
+        ws[f'C{row}'].alignment = center_align
+        ws[f'D{row}'] = fmt(completed_amount_payable)
+        ws[f'D{row}'].number_format = '#,##0.00'
+        ws[f'D{row}'].alignment = right_align
+        ws[f'D{row}'].fill = grand_fill
+        ws[f'D{row}'].font = grand_font
+        row += 2
+
+        # --- INVOICE HISTORY ---
+        ws.merge_cells(f'A{row}:D{row}')
+        ws[f'A{row}'] = "TAX INVOICE HISTORY (Excl. VAT)"
+        ws[f'A{row}'].fill = header_fill
+        ws[f'A{row}'].font = header_font
+        ws[f'A{row}'].alignment = center_align
+        row += 1
+
+        # Invoice headers
+        inv_headers = ["Invoice #", "Date", "Status", "Cum. Work", "Prev. Work", "Current Net", "Ret A", "Ret B",
+                       "Adv Rec", "Payable"]
+        for col_idx, header in enumerate(inv_headers, 1):
+            cell = ws.cell(row=row, column=col_idx, value=header)
+            cell.fill = subheader_fill
+            cell.font = subheader_font
+            cell.alignment = center_align
+            cell.border = thin_border
+        row += 1
+
+        for inv in invoices:
+            net = inv.current_certified_net_before_vat or Decimal("0")
+            ws.cell(row=row, column=1, value=inv.inv_number)
+            ws.cell(row=row, column=2, value=inv.date.strftime('%d-%b-%Y'))
+            ws.cell(row=row, column=3, value=inv.status)
+            ws.cell(row=row, column=4, value=fmt(inv.cumulative_work_done)).number_format = '#,##0.00'
+            ws.cell(row=row, column=5, value=fmt(inv.previous_work_done)).number_format = '#,##0.00'
+            ws.cell(row=row, column=6, value=fmt(net)).number_format = '#,##0.00'
+            ws.cell(row=row, column=7, value=fmt(-inv.cumulative_retention_a)).number_format = '#,##0.00'
+            ws.cell(row=row, column=8, value=fmt(-inv.cumulative_retention_b)).number_format = '#,##0.00'
+            ws.cell(row=row, column=9, value=fmt(-inv.cumulative_advance_recovered)).number_format = '#,##0.00'
+            ws.cell(row=row, column=10, value=fmt(inv.total_after_vat)).number_format = '#,##0.00'
             row += 1
 
-            for inv in invoices:
-                net = inv.current_certified_net_before_vat or Decimal("0")
-                ws.cell(row=row, column=1, value=inv.inv_number)
-                ws.cell(row=row, column=2, value=inv.date.strftime('%d-%b-%Y'))
-                ws.cell(row=row, column=3, value=inv.status)
-                ws.cell(row=row, column=4, value=fmt(inv.cumulative_work_done)).number_format = '#,##0.00'
-                ws.cell(row=row, column=5, value=fmt(inv.previous_work_done)).number_format = '#,##0.00'
-                ws.cell(row=row, column=6, value=fmt(net)).number_format = '#,##0.00'
-                ws.cell(row=row, column=7, value=fmt(-inv.cumulative_retention_a)).number_format = '#,##0.00'
-                ws.cell(row=row, column=8, value=fmt(-inv.cumulative_retention_b)).number_format = '#,##0.00'
-                ws.cell(row=row, column=9, value=fmt(-inv.cumulative_advance_recovered)).number_format = '#,##0.00'
-                ws.cell(row=row, column=10, value=fmt(inv.total_after_vat)).number_format = '#,##0.00'
-                row += 1
+        # Column widths
+        ws.column_dimensions['A'].width = 35
+        ws.column_dimensions['B'].width = 18
+        ws.column_dimensions['C'].width = 35
+        ws.column_dimensions['D'].width = 18
+        for col in range(1, 11):
+            ws.column_dimensions[get_column_letter(col)].width = 15
 
-            # Column widths
-            ws.column_dimensions['A'].width = 35
-            ws.column_dimensions['B'].width = 18
-            ws.column_dimensions['C'].width = 35
-            ws.column_dimensions['D'].width = 18
-            for col in range(1, 11):
-                ws.column_dimensions[get_column_letter(col)].width = 15
+        # Response
+        response = HttpResponse(
+            content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        )
+        response[
+            'Content-Disposition'] = f'attachment; filename="Project_Statement_{proj.project_id_code}_{date.today().strftime("%Y%m%d")}.xlsx"'
 
-            # Response
-            response = HttpResponse(
-                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-            response[
-                'Content-Disposition'] = f'attachment; filename="Project_Statement_{proj.project_id_code}_{date.today().strftime("%Y%m%d")}.xlsx"'
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        response.write(output.getvalue())
+        return response
 
-            output = io.BytesIO()
-            wb.save(output)
-            output.seek(0)
-            response.write(output.getvalue())
-            return response
-
-#############
+    #############
     def analytics_view(self, request, pk):
         company = self.get_active_company(request)
         proj = self.get_object_or_404_scoped(request, Project, pk=pk)
@@ -4561,7 +4866,8 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
     </table>
 </body></html>"""
         return HttpResponse(html)
-################################################
+
+    ################################################
 
     # =============================================================================
     # PROJECT DEDUCTIONS REPORT (New - Add to ProjectAdmin)
@@ -4575,12 +4881,18 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
         company = self.get_active_company(request)
         proj = self.get_object_or_404_scoped(request, Project, pk=pk)
         logo_url = company.logo.url if company and company.logo else ''
-
+        vat_rate = getattr(company, 'vat_percent', None) or Decimal("5")
         invoices = Invoice.objects.filter(
             project=proj, inv_type='T'
         ).exclude(is_advance_invoice=True).order_by('inv_number')
 
         latest_inv = invoices.order_by('-inv_number').first()
+
+        client_deductions_total = ClientDeduction.objects.filter(
+            project=proj,
+            invoice__in=invoices
+        ).aggregate(total=Sum('amount'))['total'] or Decimal("0")
+        client_deductions_vat = money(client_deductions_total * (vat_rate / Decimal("100")))
 
         # === BUILD INVOICE-LEVEL DEDUCTION TABLE ===
         inv_rows = ""
@@ -4636,7 +4948,7 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
         liquidated = getattr(proj, 'liquidated_damages', Decimal("0"))
 
         net_ret_held = (ret_a_cum + ret_b_cum) - (ret_a_rec + ret_b_rec)
-        total_other_ded = back_charges + est_back_charges + liquidated
+        total_other_ded = back_charges + est_back_charges + liquidated + client_deductions_total
         grand_total_deductions = cumulative_materials + net_ret_held + advance_rec + total_other_ded
 
         # === MATERIALS DETAIL TABLE ===
@@ -4716,10 +5028,22 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
                 <div class="metric-card" style="background: rgba(255,255,255,0.1); border: none; color: white;">
                     <div class="metric-value" style="color: white;">AED {total_other_ded:,.2f}</div>
                     <div class="metric-label" style="color: rgba(255,255,255,0.8);">Other Deductions</div>
+                    <tr>
+                        <td><b>Client Deductions (Supplier Payments via Client)</b></td>
+                        <td class="num text-danger">({client_deductions_total:,.2f})</td>
+                        <td><span class="badge badge-danger">Permanent</span></td>
+                        <td>Client paid supplier on our behalf</td>
+                    </tr>
+                    <tr style="background:#FFEBEE;">
+                        <td><b>VAT Input on Client Deductions</b></td>
+                        <td class="num text-success">{client_deductions_vat:,.2f}</td>
+                        <td><span class="badge badge-info">Input VAT</span></td>
+                        <td>Claimable input VAT on deducted amounts</td>
+                    </tr>
                     <div style="font-size: 8px; color: rgba(255,255,255,0.6); margin-top: 4px;">Back charges, LD, estimates</div>
                 </div>
             </div>
-            <div style="text-align: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.2);">
+                        <div style="text-align: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.2);">
                 <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; margin-bottom: 8px;">Grand Total Deductions</div>
                 <div style="font-size: 28px; font-weight: 700;">AED {grand_total_deductions:,.2f}</div>
                 <div style="font-size: 10px; opacity: 0.7; margin-top: 4px;">
@@ -4924,6 +5248,12 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
                         <td><span class="badge badge-danger">Permanent</span></td>
                         <td>As per contract penalty clauses</td>
                     </tr>
+                    <tr>
+                        <td><b>Client Deductions (Supplier Payments via Client)</b></td>
+                        <td class="num text-danger">({client_deductions_total:,.2f})</td>
+                        <td><span class="badge badge-danger">Permanent</span></td>
+                        <td>Client paid supplier on our behalf</td>
+                    </tr>
                 </tbody>
                 <tfoot>
                     <tr class="total-row">
@@ -4972,7 +5302,7 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
                         <td class="num text-danger">({advance_rec:,.2f})</td>
                     </tr>
                     <tr>
-                        <td><b>Less: Back Charges & Liquidated Damages</b></td>
+                        <td><b>Less: Back Charges, Liquidated Damages & Client Deductions</b></td>
                         <td class="num text-danger">({total_other_ded:,.2f})</td>
                     </tr>
                     <tr style="background: #ffebee;">
@@ -5010,6 +5340,7 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
             body,
             logo_url
         ))
+
     ######################
     def get_urls(self):
         urls = super().get_urls()
@@ -5026,6 +5357,7 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
 
     def fmt_po(self, obj):
         return mark_safe(f'<div style="text-align: right; font-weight: bold;">{obj.po_amount:,.2f}</div>')
+
     fmt_po.short_description = 'PO Amount'
     fmt_po.admin_order_field = 'po_amount'
 
@@ -5033,23 +5365,50 @@ class ProjectAdmin(ProfessionalReportMixin,CompanyScopedAdminMixin, admin.ModelA
         val = obj.boq_total_value
         color = "green" if obj.is_boq_complete else "red"
         return mark_safe(f'<span style="color: {color}; font-weight: bold; float: right;">{val:,.2f}</span>')
+
     fmt_boq_total.short_description = "BOQ Total"
 
     def fmt_advance(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.advance_percent:,.2f}%</div>')
+
     fmt_advance.short_description = "Adv %"
     fmt_advance.admin_order_field = "advance_percent"
 
     def fmt_ret_a_pct(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.retention_a_percent:,.2f}%</div>')
+
     fmt_ret_a_pct.short_description = "Ret A %"
     fmt_ret_a_pct.admin_order_field = "retention_a_percent"
 
     def fmt_ret_b_pct(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.retention_b_percent:,.2f}%</div>')
+
     fmt_ret_b_pct.short_description = "Ret B %"
     fmt_ret_b_pct.admin_order_field = "retention_b_percent"
 
+
+class InvoiceAutocomplete(autocomplete.Select2QuerySetView):
+    def get_queryset(self):
+        if not self.request.user.is_authenticated:
+            return Invoice.objects.none()
+
+        qs = Invoice.objects.filter(inv_type='T').exclude(is_advance_invoice=True)
+
+        # Filter by project if forwarded
+        project = self.forwarded.get('project', None)
+        if project:
+            qs = qs.filter(project_id=project)
+
+        # Also filter by company
+        from .models import CompanyProfile
+        company = CompanyProfile.get_active(self.request)
+        if company:
+            qs = qs.filter(project__company=company)
+
+        if self.q:
+            qs = qs.filter(inv_number__icontains=self.q)
+
+        return qs.order_by('-inv_number')
 
 
 # =============================================================================
@@ -5070,31 +5429,38 @@ class InvoiceItemInline(admin.TabularInline):
 
     def fmt_prev_pct(self, obj):
         return mark_safe(f'<div style="text-align:right;">{obj.prev_percentage:,.2f}%</div>')
+
     fmt_prev_pct.short_description = "Prev %"
 
     def fmt_prev_amt(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.prev_amount:,.2f}</div>')
+
     fmt_prev_amt.short_description = "Prev Amt"
 
     def fmt_gross(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.gross_amount:,.2f}</div>')
+
     fmt_gross.short_description = "Curr Amt"
 
     def fmt_cum_pct(self, obj):
         return mark_safe(f'<div style="text-align:right;">{obj.prev_percentage + obj.current_percentage:,.2f}%</div>')
+
     fmt_cum_pct.short_description = "Cum. %"
 
     def fmt_cum_amt(self, obj):
         return mark_safe(
             f'<div style="text-align:right;font-weight:bold;">{obj.prev_amount + obj.gross_amount:,.2f}</div>')
+
     fmt_cum_amt.short_description = "Cum. Amt"
 
     def fmt_ret_a(self, obj):
         return mark_safe(f'<div style="text-align:right;color:#ed6c02;">{obj.retention_a_amount:,.2f}</div>')
+
     fmt_ret_a.short_description = "Ret A"
 
     def fmt_ret_b(self, obj):
         return mark_safe(f'<div style="text-align:right;color:#ed6c02;">{obj.retention_b_amount:,.2f}</div>')
+
     fmt_ret_b.short_description = "Ret B"
 
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
@@ -5105,15 +5471,17 @@ class InvoiceItemInline(admin.TabularInline):
                 kwargs['queryset'] = BOQItem.objects.none()
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
+
 class VariationOrderInline(admin.TabularInline):
     model = VariationOrder
     extra = 0
     fields = ['description', 'amount']
 
+
 @admin.register(Invoice)
-class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+class InvoiceAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.ModelAdmin):
     company_field_path = 'project__company'
-    inlines = [InvoiceItemInline, VariationOrderInline ]
+    inlines = [InvoiceItemInline, VariationOrderInline]
     list_display = [
         "fmt_inv_str", "project", "inv_type", "status", "is_final_invoice", "retention_recovery",
         "ui_cumulative_work", "ui_total_invoiced", "ui_previously_invoiced", "ui_subtotal_no_vat",
@@ -5130,6 +5498,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         "ui_vat", "ui_total_before_deductions", "ui_payable",
         "ui_advance_balance", "ui_final_advance_recovery", "ui_remaining_advance",
         "ui_variation_total", "ui_total_with_variations",
+        "ui_client_deductions",
     ]
 
     fieldsets = (
@@ -5153,6 +5522,10 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             ),
             "classes": ["collapse"]
         }),
+        ("Client Deductions", {
+            "fields": ("ui_client_deductions",),
+            "classes": ["collapse"]
+        }),
     )
 
     def ui_variation_total(self, obj):
@@ -5171,6 +5544,64 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
     ui_total_with_variations.short_description = "Total + Variations"
 
+    def ui_client_deductions(self, obj):
+        """Display linked client deductions with VAT input amounts."""
+        deductions = obj.client_deductions.select_related(
+            'supplier_payment__supplier_invoice__supplier'
+        ).all()
+
+        if not deductions.exists():
+            return mark_safe('<span style="color:#999;">No client deductions linked.</span>')
+
+        rows = ""
+        total = Decimal("0")
+        total_vat_input = Decimal("0")
+        vat_rate = obj.vat_percent or Decimal("5")
+
+        for d in deductions:
+            sp = d.supplier_payment
+            supplier_name = sp.supplier_invoice.supplier.name if sp and sp.supplier_invoice else "N/A"
+            vat_input = money(d.amount * (vat_rate / Decimal("100")))
+            total_vat_input += vat_input
+
+            rows += f"""
+            <tr>
+                <td>{d.get_deduction_type_display()}</td>
+                <td><b>{supplier_name}</b></td>
+                <td class="num" style="color:#c62828;">({d.amount:,.2f})</td>
+                <td class="num" style="color:#6a1b9a;">{vat_input:,.2f}</td>
+                <td>{d.description[:60]}{'...' if d.description and len(d.description) > 60 else ''}</td>
+                <td><a href="{reverse('admin:billing_clientdeduction_change', args=[d.pk])}">View</a></td>
+            </tr>
+            """
+            total += d.amount
+
+        return mark_safe(f"""
+        <table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:4px;">
+            <thead>
+                <tr style="background:#f5f5f5;">
+                    <th style="text-align:left; padding:6px;">Type</th>
+                    <th style="text-align:left; padding:6px;">Supplier</th>
+                    <th style="text-align:right; padding:6px;">Amount</th>
+                    <th style="text-align:right; padding:6px;">VAT Input ({vat_rate}%)</th>
+                    <th style="text-align:left; padding:6px;">Description</th>
+                    <th style="padding:6px;"></th>
+                </tr>
+            </thead>
+            <tbody>{rows}</tbody>
+            <tfoot>
+                <tr style="background:#ffebee; font-weight:bold;">
+                    <td colspan="2" style="padding:6px;">TOTAL DEDUCTIONS</td>
+                    <td class="num" style="color:#c62828; padding:6px;">({total:,.2f})</td>
+                    <td class="num" style="color:#6a1b9a; padding:6px;">{total_vat_input:,.2f}</td>
+                    <td colspan="2"></td>
+                </tr>
+            </tfoot>
+        </table>
+        """)
+
+    ui_client_deductions.short_description = "Linked Client Deductions (with VAT Input)"
+
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
         if obj and obj.project:
@@ -5179,32 +5610,39 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
     def ui_cumulative_work(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.cumulative_work_done:,.2f}</div>')
+
     ui_cumulative_work.short_description = "Total Certified Work"
 
     def ui_total_invoiced(self, obj):
         return mark_safe(
             f'<div style="text-align:right;font-weight:bold;">{obj.net_total_invoiced_cumulative:,.2f}</div>')
+
     ui_total_invoiced.short_description = "Total Invoiced (Cum)"
 
     def ui_previously_invoiced(self, obj):
         return mark_safe(f'<div style="text-align:right;color:#666;">({obj.previous_net_total_invoiced:,.2f})</div>')
+
     ui_previously_invoiced.short_description = "Prev Invoiced"
 
     def ui_subtotal_no_vat(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.current_net_before_vat:,.2f}</div>')
+
     ui_subtotal_no_vat.short_description = "Sub Total No VAT"
 
     def ui_vat(self, obj):
         return mark_safe(f'<div style="text-align:right;">{obj.vat_amount:,.2f}</div>')
+
     ui_vat.short_description = "VAT"
 
     def ui_total_before_deductions(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.total_with_vat:,.2f}</div>')
+
     ui_total_before_deductions.short_description = "Total Before Ded."
 
     def ui_payable(self, obj):
         return mark_safe(
             f'<div style="text-align:right;"><b style="color:#d32f2f;">{obj.total_after_vat:,.2f}</b></div>')
+
     ui_payable.short_description = "Payable"
 
     def ui_previous_work(self, obj):
@@ -5227,6 +5665,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             val = obj.current_retention_a_recovery
             return format_html("<b style='color:green;'>{:,.2f}</b>", val)
         return "0.00"
+
     ui_retention_a_recovery.short_description = "Ret A Recovery"
 
     def ui_retention_b_recovery(self, obj):
@@ -5234,6 +5673,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             val = obj.current_retention_b_recovery
             return format_html("<b style='color:green;'>{:,.2f}</b>", val)
         return "0.00"
+
     ui_retention_b_recovery.short_description = "Ret B Recovery"
 
     def ui_advance_balance(self, obj):
@@ -5283,6 +5723,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             '<div style="font-weight:bold;width:120px;">{} {}</div>',
             str(obj), mark_safe(badge)
         )
+
     fmt_inv_str.short_description = "Invoice ID"
 
     def print_button(self, obj):
@@ -5290,6 +5731,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         return format_html(
             '<a class="button" href="{}" target="_blank" style="background:#447e9b; color:white; padding: 2px 8px; border-radius: 4px;">Print</a>',
             url)
+
     print_button.short_description = "Report"
 
     def get_urls(self):
@@ -5299,6 +5741,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     def print_view(self, request, pk):
         company = self.get_active_company(request)
         inv = self.get_object_or_404_scoped(request, Invoice, pk=pk)
+        vat_rate = inv.vat_percent or Decimal("5")
         logo_url = company.logo.url if company and company.logo else ''
         header_title = "PROFORMA INVOICE" if inv.inv_type == "P" else "TAX INVOICE"
 
@@ -5341,7 +5784,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             </tr>"""
 
         # ─────────────────────────────────────────────────────────────
-        # VARIATION ORDERS — calculated early for use in all pages
+        # VARIATION ORDERS
         # ─────────────────────────────────────────────────────────────
         variation_rows = ""
         var_total = Decimal("0")
@@ -5355,7 +5798,66 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 </tr>
                 """
 
+        # ─────────────────────────────────────────────────────────────
+        # CLIENT DEDUCTIONS — CURRENT INVOICE
+        # ─────────────────────────────────────────────────────────────
+        client_deductions = ClientDeduction.objects.filter(invoice=inv).select_related(
+            'supplier_payment__supplier_invoice__supplier'
+        )
+        deductions_rows_html = ""
+        total_client_deductions = Decimal("0")
+        for cd in client_deductions:
+            sp = cd.supplier_payment
+            supplier_name = "N/A"
+            if sp and sp.supplier_invoice:
+                supplier_name = sp.supplier_invoice.supplier.name
+
+            deductions_rows_html += f"""
+                <tr>
+                    <td colspan="6" class="col-label" style="color:#6a1b9a;">
+                        {cd.get_deduction_type_display()}: {supplier_name}
+                        {f' — {cd.description[:40]}' if cd.description else ''}
+                    </td>
+                    <td></td>          <!-- Previous Amt -->
+                    <td></td>          <!-- spacer -->
+                    <td class="col-num" style="color:#c62828; font-weight:bold;">({cd.amount:,.2f})</td>  <!-- Current Amt -->
+                    <td></td>          <!-- spacer -->
+                    <td class="col-num" style="color:#c62828; font-weight:bold;">({cd.amount:,.2f})</td>  <!-- Cumulative Amt -->
+                </tr>
+                            """
+            total_client_deductions += cd.amount
+
+        # ─────────────────────────────────────────────────────────────
+        # PREVIOUS PERIOD VALUES (for cumulative display)
+        # ─────────────────────────────────────────────────────────────
+        previous_invoices = Invoice.objects.filter(
+            project=inv.project,
+            date__lt=inv.date
+        ).exclude(pk=inv.pk)
+
+        # Previous client deductions
+        previous_client_deductions = Decimal("0")
+        for prev_inv in previous_invoices:
+            for pcd in ClientDeduction.objects.filter(invoice=prev_inv):
+                previous_client_deductions += pcd.amount
+
+        # Previous materials
+        previous_materials = Decimal("0")
+        for prev_inv in previous_invoices:
+            previous_materials += prev_inv.materials_exclusive or Decimal("0")
+
+        # Previous total deductions
+        previous_total_deductions = previous_client_deductions + previous_materials
+
+        # Cumulative values
+        cumulative_client_deductions = previous_client_deductions + total_client_deductions
+        cumulative_materials = previous_materials + (inv.materials_exclusive or Decimal("0"))
+        cumulative_total_deductions = previous_total_deductions + total_client_deductions + (
+                inv.materials_exclusive or Decimal("0"))
+
+        # ─────────────────────────────────────────────────────────────
         # DETECT RETENTION RECOVERY
+        # ─────────────────────────────────────────────────────────────
         is_retention_recovery = inv.retention_recovery in ['A', 'B']
         recovery_amount = Decimal("0")
         recovery_type = ""
@@ -5368,29 +5870,39 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 recovery_amount = inv.current_retention_b_recovery
                 recovery_type = "Retention B Recovery"
 
-        # KEY FIX: For retention recovery, the "net before VAT" is the recovery amount
-        # For normal invoices, it's gross minus deductions PLUS variations
+        # ─────────────────────────────────────────────────────────────
+        # NET BEFORE VAT = Gross - Advance - Retention A - Retention B + Variations
+        # (deductions are shown AFTER net before VAT)
+        # ─────────────────────────────────────────────────────────────
         if is_retention_recovery:
             net_before_vat = recovery_amount
         else:
-            # FIX: Include var_total in net_before_vat
-            net_before_vat = inv.current_gross_total - inv.current_advance_recovery - inv.current_retention_a - inv.current_retention_b + var_total
+            net_before_vat = (inv.current_gross_total
+                              - inv.current_advance_recovery
+                              - inv.current_retention_a
+                              - inv.current_retention_b
+                              + var_total)
 
-        is_credit_note = net_before_vat < 0
-
-        # VAT Output: calculated on net_before_vat (which now includes variations)
-        vat_rate = inv.vat_percent or Decimal("5")
+        # VAT Output: calculated on net_before_vat (before deductions)
         vat_output = net_before_vat * vat_rate / Decimal("100")
 
-        # Materials & VAT Input
-        materials_exclusive = inv.materials_exclusive
-        vat_input = money(materials_exclusive * vat_rate / Decimal("100"))
+        # Materials
+        materials_exclusive = inv.materials_exclusive or Decimal("0")
+
+        # Total Deductions = Client Deductions + Materials
+        total_deductions = total_client_deductions + materials_exclusive
+
+        # VAT Input on Total Deductions
+        vat_input_on_deductions = total_deductions * vat_rate / Decimal("100")
 
         # Net VAT = Output - Input (can be negative)
-        net_vat = vat_output - vat_input
+        net_vat = vat_output - vat_input_on_deductions
 
-        # Payable = Net Before VAT - Materials + Net VAT
-        payable_amount = net_before_vat - materials_exclusive + net_vat
+        # Payable = Net Before VAT + Net VAT - Total Deductions
+        payable_amount = net_before_vat + net_vat - total_deductions
+
+        # Credit note check — MUST come after payable_amount is calculated
+        is_credit_note = payable_amount < 0
 
         # Formatting helpers for negative values
         def fmt_val(val):
@@ -5428,7 +5940,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             """
 
         # ─────────────────────────────────────────────────────────────
-        # DETAIL PAGE FOOTER ROWS — FIX: variations BEFORE net total
+        # DETAIL PAGE FOOTER ROWS
         # ─────────────────────────────────────────────────────────────
         footer_rows = f"""
             <tr class='total-row'>
@@ -5471,7 +5983,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             </tr>
             """
 
-        # Show retention recovery in footer if applicable (existing logic)
+        # Show retention recovery in footer if applicable
         if inv.retention_recovery == 'A' and not is_retention_recovery:
             footer_rows += f"""
             <tr style='background:#e8f5e9;'>
@@ -5492,18 +6004,17 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             </tr>
             """
 
-        # FIX: Add variation rows BEFORE the NET BEFORE VAT line
-        footer_rows += variation_rows + variation_footer
+        # Add variation rows
+        footer_rows += variation_footer
 
-        # Cumulative net invoiced for display in footer
+        # NET BEFORE VAT (after retentions, before deductions)
         if is_retention_recovery:
             cum_net_display = inv.previous_net_total_invoiced + recovery_amount
         else:
-            # FIX: Include var_total in cumulative net display
             cum_net_display = inv.previous_net_total_invoiced + net_before_vat
 
         footer_rows += f"""
-            <tr class='grand-total-row'>
+            <tr class='grand-total-row' style='background:#e8eaf6;'>
                 <td colspan='6' class='col-label'><b>NET BEFORE VAT</b></td>
                 <td class='col-num'>{inv.previous_net_total_invoiced:,.2f}</td>
                 <td></td><td class='col-num'>{fmt_val_bold(net_before_vat)}</td>
@@ -5515,25 +6026,60 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 <td></td><td class='col-num' style='color:{vat_color}; font-weight:bold;'>{vat_sign}{fmt_val(vat_output)}</td>
                 <td></td><td class='col-num' style='color:{vat_color};'>{vat_sign}{fmt_val(vat_output)}</td>
             </tr>
+        """
+
+        # CLIENT DEDUCTIONS section with previous/current/cumulative
+        if total_client_deductions > 0 or previous_client_deductions > 0:
+            footer_rows += f"""
+            <tr style="background:#FFEBEE;">
+                <td colspan="6" class="col-label" style="color:#6a1b9a;"><b>CLIENT DEDUCTIONS</b></td>
+                <td></td><td></td><td></td><td></td>
+                <td></td>
+            </tr>
+            {deductions_rows_html}
+            <tr style="background:#FFEBEE; font-weight:bold;">
+                <td colspan="6" class="col-label"><b>Total Client Deductions</b></td>
+                <td class="col-num" style="color:#6a1b9a; font-weight:bold;">({previous_client_deductions:,.2f})</td>
+                <td></td>
+                <td class="col-num" style="color:#6a1b9a; font-weight:bold;">({total_client_deductions:,.2f})</td>
+                <td></td>
+                <td class="col-num" style="color:#6a1b9a; font-weight:bold;">({cumulative_client_deductions:,.2f})</td>
+            </tr>
+            """
+
+        # Materials Supplied by Client
+        footer_rows += f"""
             <tr>
-                <td colspan='6' class='col-label'>Materials Supplied by Client (VAT excl.)</td>
-                <td class='col-num'>—</td>
-                <td></td><td class='col-num'>({materials_exclusive:,.2f})</td>
-                <td></td><td class='col-num'>({materials_exclusive:,.2f})</td>
+                <td colspan="6" class="col-label">Materials Supplied by Client (VAT excl.)</td>
+                <td class="col-num">({previous_materials:,.2f})</td>
+                <td></td><td class="col-num">({materials_exclusive:,.2f})</td>
+                <td></td><td class="col-num">({cumulative_materials:,.2f})</td>
+            </tr>
+        """
+
+        # TOTAL DEDUCTIONS
+        footer_rows += f"""
+            <tr style="background:#FFEBEE; font-weight:bold;">
+                <td colspan="6" class="col-label"><b>TOTAL DEDUCTIONS</b></td>
+                <td class="col-num" style="color:#6a1b9a; font-weight:bold;">({previous_total_deductions:,.2f})</td>
+                <td></td>
+                <td class="col-num" style="color:#6a1b9a; font-weight:bold;">({total_deductions:,.2f})</td>
+                <td></td>
+                <td class="col-num" style="color:#6a1b9a; font-weight:bold;">({cumulative_total_deductions:,.2f})</td>
             </tr>
             <tr style='background:#fff3e0;'>
-                <td colspan='6' class='col-label' style='color:#e65100;'><b>VAT INPUT ON MATERIALS ({vat_rate}%)</b></td>
+                <td colspan='6' class='col-label' style='color:#e65100;'><b>VAT INPUT ON TOTAL DEDUCTIONS ({vat_rate}%)</b></td>
                 <td class='col-num'>—</td>
-                <td></td><td class='col-num' style='color:#e65100; font-weight:bold;'>{vat_input:,.2f}</td>
-                <td></td><td class='col-num' style='color:#e65100;'>{vat_input:,.2f}</td>
+                <td></td><td class='col-num' style='color:#e65100; font-weight:bold;'>({vat_input_on_deductions:,.2f})</td>
+                <td></td><td class='col-num' style='color:#e65100;'>({vat_input_on_deductions:,.2f})</td>
             </tr>
-            <tr class='grand-total-row' style='background:{grand_bg}; color:white;'>
+            <tr class='grand-total-row' style='background:{grand_bg}; color:black;'>
                 <td colspan='6' class='col-label'><b>NET VAT PAYABLE</b></td>
                 <td class='col-num'>—</td>
                 <td></td><td class='col-num'><b>{fmt_val(net_vat)}</b></td>
                 <td></td><td class='col-num'>{fmt_val(net_vat)}</td>
             </tr>
-            <tr class='grand-total-row' style='background:#000080; color:white;'>
+            <tr class='grand-total-row' style='background:#000080; color:black;'>
                 <td colspan='6' class='col-label'><b>TOTAL AMOUNT INCLUDING VAT</b></td>
                 <td class='col-num'>{inv.previous_net_total_invoiced:,.2f}</td>
                 <td></td><td class='col-num'><b>{fmt_val(payable_amount)}</b></td>
@@ -5546,18 +6092,23 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         # ─────────────────────────────────────────────────────────────
         logo_bar_html = f'<div class="logo-bar"><img src="{logo_url}" alt="Logo"></div>' if logo_url else ''
 
-        if company and company.bank:
-            bank_html = company.bank
-        else:
-            bank_html = (
-                '<div class="bank-row"><b>Bank:</b> WIO Bank</div>'
-                '<div class="bank-row"><b>Account Name:</b> PROCON GENERAL CONTRACTING LLC</div>'
-                '<div class="bank-row"><b>Account No:</b> 9635743367</div>'
-                '<div class="bank-row"><b>IBAN:</b> AE390860000009635743367</div>'
-                '<div class="bank-row"><b>SWIFT:</b> WIOBAEADXXX</div>'
-            )
+        def _format_bank_html(bank_text):
+            """Convert plain-text bank details into styled HTML rows."""
+            if not bank_text:
+                return '<div class="bank-row" style="color:#999;">No bank details configured.</div>'
+            lines = [line.strip() for line in bank_text.splitlines() if line.strip()]
+            html_lines = []
+            for line in lines:
+                if ':' in line:
+                    label, value = line.split(':', 1)
+                    html_lines.append(f'<div class="bank-row"><b>{label.strip()}:</b> {value.strip()}</div>')
+                else:
+                    html_lines.append(f'<div class="bank-row">{line}</div>')
+            return ''.join(html_lines)
 
-        # Amount in words for cover page
+        bank_html = _format_bank_html(company.bank if company else None)
+
+# Amount in words for cover page
         amount_words = self._number_to_words(abs(payable_amount))
         if payable_amount < 0:
             amount_words = f"(Minus {amount_words})"
@@ -5608,17 +6159,17 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             '<div class="cover-closing">'
             '<p>Thank you,</p>'
             '<p>Yours faithfully</p>'
-            f'<p>For <b>{company.company_name if company else "PROCON GENERAL CONTRACTING LLC"}</b></p>'
+            f'<p>For <b>{company.company_name if company else "—"}</b></p>'
             '<div class="cover-signature-space"></div>'
-            f'<div class="cover-signature-name">{company.contact_person if company and hasattr(company, "contact_person") and company.contact_person else "Eng. Sherif Hemaya"}</div>'
-            f'<div class="cover-signature-title">{company.contact_title if company and hasattr(company, "contact_title") and company.contact_title else "General Manager"}</div>'
+            f'<div class="cover-signature-name">{company.contact_person if company and hasattr(company, "contact_person") and company.contact_person else "—"}</div>'
+            f'<div class="cover-signature-title">{company.contact_title if company and hasattr(company, "contact_title") and company.contact_title else "—"}</div>'
             '</div>'
             '</div>'
             '</div>'
         )
 
         # ─────────────────────────────────────────────────────────────
-        # SUMMARY PAGE — FIX: include variations in net calculation
+        # SUMMARY PAGE
         # ─────────────────────────────────────────────────────────────
         summary_net_style = 'color:#c62828;' if is_credit_note else ''
         summary_vat_style = 'color:#c62828;' if is_credit_note else 'color:#1565c0;'
@@ -5629,42 +6180,49 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         if var_total > 0:
             for vo in inv.variation_orders.all():
                 summary_variation_rows += f"""
-                    <tr style="background:#0000;">
-                        <td class="summary-label">Variation: {vo.description[:55]}{'...' if len(vo.description) > 55 else ''}</td>
-                        <td class="summary-num" style="color:#6a1b9a; font-weight:bold;">{vo.amount:,.2f}</td>
-                    </tr>
-                """
-            ###
-            #summary_variation_rows += f"""
-            #        <tr style="background:#0000;">
-            #            <td class="summary-label"><b>Total Variations</b></td>
-            #           <td class="summary-num" style="color:#6a1b9a; font-weight:bold;">{var_total:,.2f}</td>
-            #       </tr>
-            #"""
-            ###
-        # Build summary rows dynamically based on invoice type
+                            <tr style="background:#0000;">
+                                <td class="summary-label">Variation: {vo.description[:55]}{'...' if len(vo.description) > 55 else ''}</td>
+                                <td class="summary-num" style="color:#6a1b9a; font-weight:bold;">{vo.amount:,.2f}</td>
+                            </tr>
+                        """
+
+        # Build client deductions rows for summary page (individual lines only)
+        summary_deductions_rows = ""
+        if total_client_deductions > 0:
+            for cd in client_deductions:
+                supplier_name = "N/A"
+                if cd.supplier_payment and cd.supplier_payment.supplier_invoice:
+                    supplier_name = cd.supplier_payment.supplier_invoice.supplier.name
+                summary_deductions_rows += f"""
+                            <tr style="background:#0000;">
+                                <td class="summary-label" style="color:#6a1b9a;">{cd.get_deduction_type_display()}: {supplier_name}</td>
+                                <td class="summary-num" style="color:#c62828; font-weight:bold;">({cd.amount:,.2f})</td>
+                            </tr>
+                        """
+
+        # Build standard deduction rows
         if is_retention_recovery:
             summary_deduction_rows = f"""
-                    <tr>
-                        <td class="summary-label"><b>{recovery_type}</b></td>
-                        <td class="summary-num" style="color:#2e7d32; font-weight:bold;">{recovery_amount:,.2f}</td>
-                    </tr>
-                """
+                            <tr>
+                                <td class="summary-label"><b>{recovery_type}</b></td>
+                                <td class="summary-num" style="color:#2e7d32; font-weight:bold;">{recovery_amount:,.2f}</td>
+                            </tr>
+                        """
         else:
             summary_deduction_rows = f"""
-                    <tr>
-                        <td class="summary-label">Advance Recovery</td>
-                        <td class="summary-num">({inv.current_advance_recovery:,.2f})</td>
-                    </tr>
-                    <tr>
-                        <td class="summary-label">Retention A ({inv.project.retention_a_percent}%)</td>
-                        <td class="summary-num">({inv.current_retention_a:,.2f})</td>
-                    </tr>
-                    <tr>
-                        <td class="summary-label">Retention B ({inv.project.retention_b_percent}%)</td>
-                        <td class="summary-num">({inv.current_retention_b:,.2f})</td>
-                    </tr>
-                """
+                            <tr>
+                                <td class="summary-label">Advance Recovery</td>
+                                <td class="summary-num">({inv.current_advance_recovery:,.2f})</td>
+                            </tr>
+                            <tr>
+                                <td class="summary-label">Retention A ({inv.project.retention_a_percent}%)</td>
+                                <td class="summary-num">({inv.current_retention_a:,.2f})</td>
+                            </tr>
+                            <tr>
+                                <td class="summary-label">Retention B ({inv.project.retention_b_percent}%)</td>
+                                <td class="summary-num">({inv.current_retention_b:,.2f})</td>
+                            </tr>
+                        """
 
         summary_page = (
                 '<div class="page summary-page">'
@@ -5678,7 +6236,7 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 '</div>'
                 '<div class="parties-row">'
                 '<div class="party-block">'
-                f'<div class="party-name">{company.company_name if company else "PROCON GENERAL CONTRACTING LLC"}</div>'
+                f'<div class="party-name">{company.company_name if company else "—"}</div>'
                 f'<div class="party-detail"><b>TRN:</b> {company.trn_number if company and company.trn_number else "N/A"}</div>'
                 '</div>'
                 '<div class="party-block" style="text-align:right;">'
@@ -5694,87 +6252,110 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
         if not is_retention_recovery:
             summary_page += f"""
-                    <tr>
-                        <td class="summary-label">Total Work Done</td>
-                        <td class="summary-num">{inv.cumulative_work_done:,.2f}</td>
-                    </tr>
-                    <tr>
-                        <td class="summary-label">Previously Invoiced</td>
-                        <td class="summary-num">({inv.previous_net_total_invoiced:,.2f})</td>
-                    </tr>
-                    <tr>
-                        <td class="summary-label">Current Gross Work</td>
-                        <td class="summary-num">{inv.current_gross_total:,.2f}</td>
-                    </tr>
-                """
+                            <tr>
+                                <td class="summary-label">Total Invoiced (Cumulative)</td>
+                                <td class="summary-num">{inv.cumulative_work_done:,.2f}</td>
+                            </tr>
+                            <tr>
+                                <td class="summary-label">Previously Invoiced</td>
+                                <td class="summary-num deduction">({inv.previous_net_total_invoiced:,.2f})</td>
+                            </tr>
+                            <tr>
+                                <td class="summary-label">Current Gross Work</td>
+                                <td class="summary-num">{inv.current_gross_total:,.2f}</td>
+                            </tr>
+                        """
         else:
             summary_page += f"""
-                    <tr>
-                        <td class="summary-label">Total Work Done</td>
-                        <td class="summary-num">{inv.cumulative_work_done:,.2f}</td>
-                    </tr>
-                    <tr>
-                        <td class="summary-label">Previously Invoiced</td>
-                        <td class="summary-num">({inv.previous_net_total_invoiced:,.2f})</td>
-                    </tr>
-                    <tr style="background:#e8f5e9;">
-                        <td class="summary-label"><b>{recovery_type}</b></td>
-                        <td class="summary-num" style="color:#2e7d32; font-weight:bold;">{recovery_amount:,.2f}</td>
-                    </tr>
-                """
+                            <tr>
+                                <td class="summary-label">Total Invoiced (Cumulative)</td>
+                                <td class="summary-num">{inv.cumulative_work_done:,.2f}</td>
+                            </tr>
+                            <tr>
+                                <td class="summary-label">Previously Invoiced</td>
+                                <td class="summary-num deduction">({inv.previous_net_total_invoiced:,.2f})</td>
+                            </tr>
+                            <tr style="background:#e8f5e9;">
+                                <td class="summary-label"><b>{recovery_type}</b></td>
+                                <td class="summary-num" style="color:#2e7d32; font-weight:bold;">{recovery_amount:,.2f}</td>
+                            </tr>
+                        """
 
-        # FIX: Add variations BEFORE deductions in summary, and include in net
+        # Add variations
         summary_page += summary_variation_rows
+
+        # Add standard deductions (advance, retention)
         summary_page += summary_deduction_rows
 
+        # Net Before VAT (after retentions, before deductions)
         summary_page += f"""
-                    <tr class="summary-subtotal">
-                        <td class="summary-label"><b>Net Payable Amount without VAT</b></td>
-                        <td class="summary-num" style="{summary_net_style}"><b>{fmt_val(net_before_vat)}</b></td>
-                    </tr>
-                    <tr style="background:#e3f2fd;">
-                        <td class="summary-label" style="{summary_vat_style}"><b>VAT Output ({vat_rate}%)</b></td>
-                        <td class="summary-num" style="{summary_vat_style} font-weight:bold;">{vat_sign}{fmt_val(vat_output)}</td>
-                    </tr>
-                    <tr>
-                        <td class="summary-label">Materials Supplied by Client (VAT excl.)</td>
-                        <td class="summary-num deduction">({materials_exclusive:,.2f})</td>
-                    </tr>
-                    <tr style="background:#fff3e0;">
-                        <td class="summary-label" style="color:#e65100;"><b>VAT Input on Materials ({vat_rate}%)</b></td>
-                        <td class="summary-num" style="color:#e65100; font-weight:bold;">({vat_input:,.2f})</td>
-                    </tr>
-                    <tr class="summary-subtotal" style="background:#e8eaf6;">
-                        <td class="summary-label"><b>Net VAT Payable</b></td>
-                        <td class="summary-num"><b>{fmt_val(net_vat)}</b></td>
-                    </tr>
-                    <tr class="summary-grand">
-                        <td class="summary-label"><b>Net Payable Amount</b></td>
-                        <td class="summary-num" style="{summary_payable_style}"><b>{fmt_val(payable_amount)}</b></td>
-                    </tr>
-                    </tbody>
-                    </table>
-                    <div class="summary-words">
-                        <b>AED {amount_words}</b>
-                    </div>
-                    <div class="bank-details">
-                        <div class="bank-title">Payment to be made by Bank transfer to:</div>
-                        <div class="bank-content">
-                        {bank_html}
-                        </div>
-                    </div>
-                    <div class="summary-signatures">
-                        <div class="sig-block">
-                            <div class="sig-line"></div>
-                            <div class="sig-name">Technical Manager</div>
-                        </div>
-                        <div class="sig-block">
-                            <div class="sig-line"></div>
-                            <div class="sig-name">Finance Director</div>
-                        </div>
-                    </div>
-                    </div>
-            """
+                            <tr class="summary-subtotal">
+                                <td class="summary-label"><b>NET BEFORE VAT</b></td>
+                                <td class="summary-num" style="{summary_net_style}"><b>{fmt_val(net_before_vat)}</b></td>
+                            </tr>
+                            <tr style="background:#e3f2fd;">
+                                <td class="summary-label" style="{summary_vat_style}"><b>VAT Output ({vat_rate}%)</b></td>
+                                <td class="summary-num" style="{summary_vat_style} font-weight:bold;">{vat_sign}{fmt_val(vat_output)}</td>
+                            </tr>
+                """
+
+        # Client deductions (individual lines)
+        summary_page += summary_deductions_rows
+
+        # Client deductions total
+        if total_client_deductions > 0:
+            summary_page += f"""
+                            <tr style="background:#FFEBEE;">
+                                <td class="summary-label" style="color:#6a1b9a;"><b>Client Deductions (Supplier Payment)</b></td>
+                                <td class="summary-num" style="color:#6a1b9a; font-weight:bold;">({total_client_deductions:,.2f})</td>
+                            </tr>
+                        """
+
+        # Materials, Total Deductions, VAT Input, Net VAT, Payable
+        summary_page += f"""
+                            <tr>
+                                <td class="summary-label">Materials Supplied by Client (VAT excl.)</td>
+                                <td class="summary-num deduction">({materials_exclusive:,.2f})</td>
+                            </tr>
+                            <tr style="background:#FFEBEE;">
+                                <td class="summary-label" style="color:#6a1b9a;"><b>Total Deductions</b></td>
+                                <td class="summary-num" style="color:#6a1b9a; font-weight:bold;">({total_deductions:,.2f})</td>
+                            </tr>
+                            <tr style="background:#fff3e0;">
+                                <td class="summary-label" style="color:#e65100;"><b>VAT Input on Total Deductions ({vat_rate}%)</b></td>
+                                <td class="summary-num" style="color:#e65100; font-weight:bold;">({vat_input_on_deductions:,.2f})</td>
+                            </tr>
+                            <tr class="summary-subtotal" style="background:#e8eaf6;">
+                                <td class="summary-label"><b>Net VAT Payable</b></td>
+                                <td class="summary-num"><b>{fmt_val(net_vat)}</b></td>
+                            </tr>
+                            <tr class="summary-grand">
+                                <td class="summary-label"><b>Net Payable Amount</b></td>
+                                <td class="summary-num" style="{summary_payable_style}"><b>{fmt_val(payable_amount)}</b></td>
+                            </tr>
+                            </tbody>
+                            </table>
+                            <div class="summary-words">
+                                <b>AED {amount_words}</b>
+                            </div>
+                            <div class="bank-details">
+                                <div class="bank-title">Payment to be made by Bank transfer to:</div>
+                                <div class="bank-content">
+                                {bank_html}
+                                </div>
+                            </div>
+                            <div class="summary-signatures">
+                                <div class="sig-block">
+                                    <div class="sig-line"></div>
+                                    <div class="sig-name">Technical Manager</div>
+                                </div>
+                                <div class="sig-block">
+                                    <div class="sig-line"></div>
+                                    <div class="sig-name">Finance Director</div>
+                                </div>
+                            </div>
+                            </div>
+                    """
 
         # ─────────────────────────────────────────────────────────────
         # DETAIL PAGE
@@ -5839,172 +6420,174 @@ class InvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
         if is_retention_recovery:
             detail_page += f"""
-                <div class="summary-row" style="background:#e8f5e9; padding:2px 0;"><span><b>{recovery_type}:</b></span><span style="color:#2e7d32; font-weight:bold;">{recovery_amount:,.2f}</span></div>
-            """
+                        <div class="summary-row" style="background:#e8f5e9; padding:2px 0;"><span><b>{recovery_type}:</b></span><span style="color:#2e7d32; font-weight:bold;">{recovery_amount:,.2f}</span></div>
+                    """
         else:
             detail_page += f"""
-                <div class="summary-row"><span>Current Gross Work:</span><span>{inv.current_gross_total:,.2f}</span></div>
-                <div class="summary-row"><span>Advance Recovery:</span><span>({inv.current_advance_recovery:,.2f})</span></div>
-                <div class="summary-row"><span>Retention A:</span><span>({inv.current_retention_a:,.2f})</span></div>
-                <div class="summary-row"><span>Retention B:</span><span>({inv.current_retention_b:,.2f})</span></div>
-            """
+                        <div class="summary-row"><span>Current Gross Work:</span><span>{inv.current_gross_total:,.2f}</span></div>
+                        <div class="summary-row"><span>Advance Recovery:</span><span>({inv.current_advance_recovery:,.2f})</span></div>
+                        <div class="summary-row"><span>Retention A:</span><span>({inv.current_retention_a:,.2f})</span></div>
+                        <div class="summary-row"><span>Retention B:</span><span>({inv.current_retention_b:,.2f})</span></div>
+                    """
 
-        # FIX: Add variations to detail page summary box
+        # Add variations to detail page summary box
         if var_total > 0:
             detail_page += f"""
-                <div class="summary-row" style="background:#0000; padding:2px 0;"><span><b>Variations:</b></span><span style="color:#6a1b9a; font-weight:bold;">{var_total:,.2f}</span></div>
-            """
+                        <div class="summary-row" style="background:#0000; padding:2px 0;"><span><b>Variations:</b></span><span style="color:#6a1b9a; font-weight:bold;">{var_total:,.2f}</span></div>
+                    """
 
+        # Net Before VAT
         detail_page += f"""
-                <div class="summary-row border-top" style="font-weight:bold;"><span>Net Before VAT:</span>
-                <span style="{summary_net_style}">{fmt_val(net_before_vat)}</span></div>
-                <div class="summary-row" style="{summary_vat_style}"><span>VAT Output ({vat_rate}%):</span><span>{vat_sign}{fmt_val(vat_output)}</span></div>
-                <div class="summary-row"><span>Materials Supplied by Client:</span><span>({materials_exclusive:,.2f})</span></div>
-                <div class="summary-row" style="color:#e65100;"><span>VAT Input on Materials ({vat_rate}%):</span><span>({vat_input:,.2f})</span></div>
-                <div class="summary-row" style="font-weight:bold; background:#e8eaf6; padding:4px 0;"><span>Net VAT Payable:</span>
-                <span>{fmt_val(net_vat)}</span></div>
-                <div class="summary-row border-top red-text"><span>Payable Amount:</span>
-                <span style="{summary_payable_style}">{fmt_val(payable_amount)}</span></div>
-                </div>
-                </div>
-                </div>
-        """
+                        <div class="summary-row border-top" style="font-weight:bold;"><span>Net Before VAT:</span>
+                        <span style="{summary_net_style}">{fmt_val(net_before_vat)}</span></div>
+                        <div class="summary-row" style="{summary_vat_style}"><span>VAT Output ({vat_rate}%):</span><span>{vat_sign}{fmt_val(vat_output)}</span></div>
+                """
+
+        # Client deductions (individual lines)
+        if total_client_deductions > 0:
+            for cd in client_deductions:
+                supplier_name = "N/A"
+                if cd.supplier_payment and cd.supplier_payment.supplier_invoice:
+                    supplier_name = cd.supplier_payment.supplier_invoice.supplier.name
+                detail_page += f"""
+                        <div class="summary-row" style="background:#0000; padding:2px 0;"><span style="color:#6a1b9a;">{cd.get_deduction_type_display()}: {supplier_name}</span><span style="color:#c62828; font-weight:bold;">({cd.amount:,.2f})</span></div>
+                        """
+            detail_page += f"""
+                        <div class="summary-row" style="background:#FFEBEE; padding:2px 0; font-weight:bold;"><span style="color:#6a1b9a;"><b>Client Deductions (Supplier Payment):</b></span><span style="color:#6a1b9a; font-weight:bold;">({total_client_deductions:,.2f})</span></div>
+                    """
+
+        # Materials, Total Deductions, VAT Input, Net VAT, Payable
+        detail_page += f"""
+                        <div class="summary-row"><span>Materials Supplied by Client:</span><span>({materials_exclusive:,.2f})</span></div>
+                        <div class="summary-row" style="background:#FFEBEE; padding:2px 0; font-weight:bold;"><span style="color:#6a1b9a;"><b>Total Deductions:</b></span><span style="color:#6a1b9a; font-weight:bold;">({total_deductions:,.2f})</span></div>
+                        <div class="summary-row" style="color:#e65100;"><span>VAT Input on Total Deductions ({vat_rate}%):</span><span>({vat_input_on_deductions:,.2f})</span></div>
+                        <div class="summary-row" style="font-weight:bold; background:#e8eaf6; padding:4px 0;"><span>Net VAT Payable:</span>
+                        <span>{fmt_val(net_vat)}</span></div>
+                        <div class="summary-row border-top red-text"><span>Payable Amount:</span>
+                        <span style="{summary_payable_style}">{fmt_val(payable_amount)}</span></div>
+                        </div>
+                        </div>
+                        </div>
+                """
 
         html = f"""<!DOCTYPE html>
-    <html>
-    <head>
-    <meta charset="UTF-8">
-    <style>
-        @page {{ size: A4 portrait; margin: 12mm; }}
-        * {{ box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; margin: 0; padding: 0; }}
-        body {{ font-family: "Segoe UI", Arial, Helvetica, sans-serif; font-size: 9px; line-height: 1.3; color: #222; }}
-
-        .page {{ page-break-after: always; break-after: page; position: relative; padding: 8mm; }}
-        .page:last-child {{ page-break-after: auto; }}
-
-        .logo-bar {{ text-align: right; margin-bottom: 12px; }}
-        .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
-
-        .cover-page {{ display: flex; flex-direction: column; min-height: calc(100vh - 20mm); }}
-        .cover-content {{ margin-top: 20px; }}
-        .cover-ref {{ margin-bottom: 25px; }}
-        .cover-ref-line {{ font-size: 10px; margin-bottom: 5px; }}
-        .cover-label {{ font-weight: bold; display: inline-block; min-width: 50px; }}
-        .cover-to {{ margin-bottom: 15px; }}
-        .cover-to-line {{ font-size: 10px; margin-bottom: 3px; }}
-        .cover-attn {{ margin-bottom: 12px; font-size: 10px; }}
-        .cover-project {{ margin-bottom: 12px; font-size: 10px; }}
-        .cover-subject {{ margin-bottom: 25px; font-size: 10px; }}
-        .cover-body {{ margin-bottom: 30px; font-size: 10px; line-height: 1.7; }}
-        .cover-body p {{ margin-bottom: 10px; }}
-        .cover-closing {{ margin-top: auto; font-size: 10px; }}
-        .cover-closing p {{ margin-bottom: 6px; }}
-        .cover-signature-space {{ height: 50px; }}
-        .cover-signature-name {{ font-weight: bold; margin-top: 8px; }}
-        .cover-signature-title {{ color: #666; }}
-
-        .summary-meta {{ margin-bottom: 12px; }}
-        .summary-meta-row {{ font-size: 10px; font-weight: bold; margin-bottom: 3px; }}
-        .parties-row {{ display: flex; justify-content: space-between; margin: 12px 0; gap: 15px; }}
-        .party-block {{ flex: 1; }}
-        .party-name {{ font-size: 12px; font-weight: bold; margin-bottom: 2px; }}
-        .party-detail {{ font-size: 9px; margin-bottom: 2px; }}
-        .project-name {{ font-size: 9px; margin: 8px 0 12px 0; }}
-        .section-title {{ text-align: center; font-size: 13px; font-weight: bold; margin: 12px 0 10px 0; color: #111; border-bottom: 2px solid #000080; padding-bottom: 5px; }}
-
-        .summary-table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 10px; table-layout: fixed; }}
-        .summary-table td {{ padding: 6px 10px; border-bottom: 1px solid #ddd; vertical-align: middle; }}
-        .summary-table tr:last-child td {{ border-bottom: 2px solid #000080; }}
-        .summary-table .summary-label {{ text-align: left; width: 65%; }}
-        .summary-table .summary-num {{ text-align: right; font-weight: bold; width: 35%; white-space: nowrap; overflow-wrap: break-word; word-break: break-all; }}
-        .summary-table .deduction {{ color: #c62828; }}
-        .summary-subtotal td {{ background: #f5f5f5; }}
-        .summary-grand td {{ background: #000080; color: white; font-size: 11px; }}
-        .summary-grand .summary-label {{ color: white; }}
-        .summary-grand .summary-num {{ color: white; }}
-
-        .summary-words {{ text-align: center; margin: 12px 0; font-size: 10px; color: #333; }}
-
-        .bank-details {{ margin-top: 20px; border: 1px solid #ccc; padding: 10px; border-radius: 3px; }}
-        .bank-title {{ font-weight: bold; font-size: 9px; margin-bottom: 6px; color: #000080; }}
-        .bank-content {{ font-family: "Courier New", monospace; font-size: 9px; line-height: 1.5; }}
-        .bank-row {{ margin-bottom: 2px; }}
-
-        .summary-signatures {{ display: flex; justify-content: space-between; margin-top: 30px; gap: 50px; }}
-        .sig-block {{ flex: 1; text-align: center; }}
-        .sig-line {{ border-top: 1px solid #333; margin-top: 40px; padding-top: 6px; }}
-        .sig-name {{ font-size: 9px; font-weight: bold; }}
-
-        .invoice-title {{ font-size: 14px; font-weight: bold; text-align: center; margin: 6px 0 10px 0; color: #000080; letter-spacing: 1px; }}
-        .invoice-meta {{ margin-bottom: 8px; }}
-        .invoice-meta-row {{ font-size: 10px; font-weight: bold; margin-bottom: 3px; }}
-
-        .boq-table {{ width: 100%; border-collapse: collapse; margin-top: 5px; font-size: 7.5px; table-layout: fixed; }}
-        .boq-table thead {{ display: table-header-group; }}
-        .boq-table th {{ background: #e8e8e8; border: 1px solid #666; padding: 3px 2px; font-weight: bold; text-align: center; font-size: 7px; word-wrap: break-word; line-height: 1.2; }}
-        .boq-table td {{ border: 1px solid #666; padding: 2px 3px; vertical-align: top; }}
-        .boq-table .col-item {{ width: 5%; text-align: center; }}
-        .boq-table .col-desc {{ width: 28%; text-align: left; }}
-        .boq-table .col-unit {{ width: 5%; text-align: center; }}
-        .boq-table .col-num {{ width: 7%; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-        .boq-table .col-label {{ text-align: right; font-weight: bold; padding-right: 6px; }}
-        .boq-table td.col-desc {{ font-size: 7px; line-height: 1.2; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto; }}
-        .boq-table .total-row td {{ font-weight: bold; background: #f0f0f0; border-top: 2px solid #333; }}
-        .boq-table .grand-total-row td {{ font-weight: bold; background: #f5f5f5; border-top: 2px solid #333; border-bottom: 2px solid #333; }}
-        .boq-table tr {{ page-break-inside: avoid; }}
-
-        .summary-wrapper {{ display: flex; justify-content: space-between; margin-top: 12px; gap: 12px; page-break-inside: avoid; }}
-        .summary-box {{ border: 1px solid #666; padding: 6px 10px; }}
-        .summary-box.bank {{ flex: 1; max-width: 48%; }}
-        .summary-box.totals {{ flex: 1; max-width: 48%; margin-left: auto; }}
-        .summary-box-title {{ font-weight: bold; margin-bottom: 4px; text-decoration: underline; font-size: 8px; }}
-        .summary-box .summary-row {{ display: flex; justify-content: space-between; margin-bottom: 3px; font-size: 8px; }}
-        .summary-box .summary-row.border-top {{ border-top: 1px solid #333; margin-top: 4px; padding-top: 4px; }}
-        .red-text {{ color: #000080; font-weight: bold; font-size: 1.3em; }}
-        .page-break-avoid {{ page-break-inside: avoid; }}
-    </style>
-    </head>
-    <body>
-        {cover_page}
-        {summary_page}
-        {detail_page}
-        <script>window.onload = function() {{ window.print(); }}</script>
-    </body>
-    </html>"""
+            <html>
+            <head>
+            <meta charset="UTF-8">
+            <style>
+                @page {{ size: A4 portrait; margin: 12mm; }}
+                * {{ box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; margin: 0; padding: 0; }}
+                body {{ font-family: "Segoe UI", Arial, Helvetica, sans-serif; font-size: 9px; line-height: 1.3; color: #222; }}
+        
+                .page {{ page-break-after: always; break-after: page; position: relative; padding: 8mm; }}
+                .page:last-child {{ page-break-after: auto; }}
+        
+                .logo-bar {{ text-align: right; margin-bottom: 12px; }}
+                .logo-bar img {{ max-height: 120px; max-width: 240px; object-fit: contain; }}
+        
+                .cover-page {{ display: flex; flex-direction: column; min-height: calc(100vh - 20mm); }}
+                .cover-content {{ margin-top: 20px; }}
+                .cover-ref {{ margin-bottom: 25px; }}
+                .cover-ref-line {{ font-size: 10px; margin-bottom: 5px; }}
+                .cover-label {{ font-weight: bold; display: inline-block; min-width: 50px; }}
+                .cover-to {{ margin-bottom: 15px; }}
+                .cover-to-line {{ font-size: 10px; margin-bottom: 3px; }}
+                .cover-attn {{ margin-bottom: 12px; font-size: 10px; }}
+                .cover-project {{ margin-bottom: 12px; font-size: 10px; }}
+                .cover-subject {{ margin-bottom: 25px; font-size: 10px; }}
+                .cover-body {{ margin-bottom: 30px; font-size: 10px; line-height: 1.7; }}
+                .cover-body p {{ margin-bottom: 10px; }}
+                .cover-closing {{ margin-top: auto; font-size: 10px; }}
+                .cover-closing p {{ margin-bottom: 6px; }}
+                .cover-signature-space {{ height: 50px; }}
+                .cover-signature-name {{ font-weight: bold; margin-top: 8px; }}
+                .cover-signature-title {{ color: #666; }}
+        
+                .summary-meta {{ margin-bottom: 12px; }}
+                .summary-meta-row {{ font-size: 10px; font-weight: bold; margin-bottom: 3px; }}
+                .parties-row {{ display: flex; justify-content: space-between; margin: 12px 0; gap: 15px; }}
+                .party-block {{ flex: 1; }}
+                .party-name {{ font-size: 12px; font-weight: bold; margin-bottom: 2px; }}
+                .party-detail {{ font-size: 9px; margin-bottom: 2px; }}
+                .project-name {{ font-size: 9px; margin: 8px 0 12px 0; }}
+                .section-title {{ text-align: center; font-size: 13px; font-weight: bold; margin: 12px 0 10px 0; color: #111; border-bottom: 2px solid #000080; padding-bottom: 5px; }}
+        
+                .summary-table {{ width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 10px; table-layout: fixed; }}
+                .summary-table td {{ padding: 6px 10px; border-bottom: 1px solid #ddd; vertical-align: middle; }}
+                .summary-table tr:last-child td {{ border-bottom: 2px solid #000080; }}
+                .summary-table .summary-label {{ text-align: left; width: 65%; }}
+                .summary-table .summary-num {{ text-align: right; font-weight: bold; width: 35%; white-space: nowrap; overflow-wrap: break-word; word-break: break-all; }}
+                .summary-table .deduction {{ color: #c62828; }}
+                .summary-subtotal td {{ background: #f5f5f5; }}
+                .summary-grand td {{ background: #e8eaf6; color: #000080; font-size: 11px; border-top: 2px solid #000080; border-bottom: 2px solid #000080; }}
+                .summary-grand .summary-label {{ color: #000080; }}
+                .summary-grand .summary-num {{ color: #000080; }}
+        
+                .summary-words {{ text-align: center; margin: 12px 0; font-size: 10px; color: #333; }}
+        
+                .bank-details {{ margin-top: 20px; border: 1px solid #ccc; padding: 10px; border-radius: 3px; }}
+                .bank-title {{ font-weight: bold; font-size: 9px; margin-bottom: 6px; color: #000080; }}
+                .bank-content {{ font-family: "Courier New", monospace; font-size: 9px; line-height: 1.5; }}
+                .bank-row {{ margin-bottom: 2px; }}
+        
+                .summary-signatures {{ display: flex; justify-content: space-between; margin-top: 30px; gap: 50px; }}
+                .sig-block {{ flex: 1; text-align: center; }}
+                .sig-line {{ border-top: 1px solid #333; margin-top: 40px; padding-top: 6px; }}
+                .sig-name {{ font-size: 9px; font-weight: bold; }}
+        
+                .invoice-title {{ font-size: 14px; font-weight: bold; text-align: center; margin: 6px 0 10px 0; color: #000080; letter-spacing: 1px; }}
+                .invoice-meta {{ margin-bottom: 8px; }}
+                .invoice-meta-row {{ font-size: 10px; font-weight: bold; margin-bottom: 3px; }}
+        
+                .boq-table {{ width: 100%; border-collapse: collapse; margin-top: 5px; font-size: 7.5px; table-layout: fixed; }}
+                .boq-table thead {{ display: table-header-group; }}
+                .boq-table th {{ background: #e8e8e8; border: 1px solid #666; padding: 3px 2px; font-weight: bold; text-align: center; font-size: 7px; word-wrap: break-word; line-height: 1.2; }}
+                .boq-table td {{ border: 1px solid #666; padding: 2px 3px; vertical-align: top; }}
+                .boq-table .col-item {{ width: 5%; text-align: center; }}
+                .boq-table .col-desc {{ width: 28%; text-align: left; }}
+                .boq-table .col-unit {{ width: 5%; text-align: center; }}
+                .boq-table .col-num {{ width: 7%; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+                .boq-table .col-label {{ text-align: right; font-weight: bold; padding-right: 6px; }}
+                .boq-table td.col-desc {{ font-size: 7px; line-height: 1.2; word-wrap: break-word; overflow-wrap: break-word; hyphens: auto; }}
+                .boq-table .total-row td {{ font-weight: bold; background: #f0f0f0; border-top: 2px solid #333; }}
+                .boq-table .grand-total-row td {{ font-weight: bold; background: #f5f5f5; border-top: 2px solid #333; border-bottom: 2px solid #333; }}
+                .boq-table tr {{ page-break-inside: avoid; }}
+        
+                .summary-wrapper {{ display: flex; justify-content: space-between; margin-top: 12px; gap: 12px; page-break-inside: avoid; }}
+                .summary-box {{ border: 1px solid #666; padding: 6px 10px; }}
+                .summary-box.bank {{ flex: 1; max-width: 48%; }}
+                .summary-box.totals {{ flex: 1; max-width: 48%; margin-left: auto; }}
+                .summary-box-title {{ font-weight: bold; margin-bottom: 4px; text-decoration: underline; font-size: 8px; }}
+                .summary-box .summary-row {{ display: flex; justify-content: space-between; margin-bottom: 3px; font-size: 8px; }}
+                .summary-box .summary-row.border-top {{ border-top: 1px solid #333; margin-top: 4px; padding-top: 4px; }}
+                .red-text {{ color: #000080; font-weight: bold; font-size: 1.3em; }}
+                .page-break-avoid {{ page-break-inside: avoid; }}
+            </style>
+            </head>
+            <body>
+                {cover_page}
+                {summary_page}
+                {detail_page}
+                <script>window.onload = function() {{ window.print(); }}</script>
+            </body>
+            </html>"""
         return HttpResponse(html)
 
-    def _number_to_words(self, number):
-        """Convert a number to words. Handles negative values with 'Minus' in parentheses."""
-        try:
-            from num2words import num2words
-            is_negative = number < 0
-            abs_number = abs(number)
-            integer_part = int(abs_number)
-            decimal_part = int((abs_number - integer_part) * 100)
-            words = num2words(integer_part, lang='en').replace(',', '').title()
-            if decimal_part > 0:
-                words += f" and {decimal_part:02d}/100"
-            if is_negative:
-                words = f"(Minus {words})"
-            return words
-        except Exception:
-            integer_part = int(abs(number))
-            decimal_part = int((abs(number) - integer_part) * 100)
-            result = f"{integer_part} and {decimal_part:02d}/100"
-            if number < 0:
-                result = f"(Minus {result})"
-            return result
+
+
 
     def logo_preview(self, obj):
         if obj.logo:
             return format_html('<img src="{}" style="max-height:120px; max-width:240px;" />', obj.logo.url)
         return "—"
+
+
     logo_preview.short_description = "Logo Preview"
 
 
-# =============================================================================
-# EXPENSE ADMIN
-# =============================================================================
+        # =============================================================================
+        # EXPENSE ADMIN
+        # =============================================================================
 
 class SubExpenseInline(admin.TabularInline):
     model = SubExpense
@@ -6012,7 +6595,7 @@ class SubExpenseInline(admin.TabularInline):
 
 
 @admin.register(ExpenseCategory)
-class ExpenseCategoryAdmin(CompanyScopedAdminMixin,admin.ModelAdmin):
+class ExpenseCategoryAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     company_field_path = 'company'
     list_display = ["name", "sub_expense_count", "default_supplier", "company"]
     list_filter = ["company", "default_supplier"]
@@ -6022,6 +6605,7 @@ class ExpenseCategoryAdmin(CompanyScopedAdminMixin,admin.ModelAdmin):
 
     def sub_expense_count(self, obj):
         return obj.sub_expenses.count()
+
     sub_expense_count.short_description = "Sub-Expenses"
 
     def get_urls(self):
@@ -6052,7 +6636,7 @@ class ExpenseAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     ]
     list_filter = [
         "project__company", "project", "category", "supplier",
-        "date", "is_allocated", "is_auto_generated"
+        "date", "is_allocated", "is_auto_generated"  # Add this
     ]
     search_fields = ["description", "reference_number", "supplier__name"]
     autocomplete_fields = ["project", "boq_item", "supplier", "supplier_invoice"]
@@ -6089,6 +6673,7 @@ class ExpenseAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 f'<div style="font-size:10px;"><b>{obj.supplier.name}</b></div>'
             )
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_supplier.short_description = "Supplier"
 
     def supplier_invoice_link(self, obj):
@@ -6101,10 +6686,12 @@ class ExpenseAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 f'</a>'
             )
         return mark_safe('<span style="color:#999;">No linked invoice</span>')
+
     supplier_invoice_link.short_description = "Linked Supplier Invoice"
 
     def fmt_amount(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.amount:,.2f}</div>')
+
     fmt_amount.short_description = "Amount"
 
     def get_form(self, request, obj=None, **kwargs):
@@ -6152,6 +6739,14 @@ class ExpenseAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         else:
             return super().formfield_for_foreignkey(db_field, request, **kwargs)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
+    def auto_generated_badge(self, obj):
+        if obj.is_auto_generated:
+            return mark_safe(
+                '<span style="background:#e3f2fd; color:#1565c0; padding:2px 6px; border-radius:3px; font-size:9px;">🤖 Auto</span>')
+        return mark_safe('<span style="color:#999;">Manual</span>')
+
+    auto_generated_badge.short_description = "Source"
 
 
 # =============================================================================
@@ -6281,6 +6876,7 @@ class EmployeeAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         except Exception as e:
             logger.error(f"DEBUG EOS ERROR for {obj}: {e}", exc_info=True)
             return mark_safe(f'<span style="color:red; font-weight:bold;">ERROR: {str(e)[:40]}</span>')
+
     display_eos.short_description = "EOSB (End of Service Benefit)"
 
     def get_queryset(self, request):
@@ -6291,6 +6887,7 @@ class EmployeeAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         if obj.is_head_office:
             return mark_safe('<b style="color:#000080;">HEAD OFFICE</b>')
         return obj.project.project_id_code if obj.project else mark_safe('<span style="color:#999;">—</span>')
+
     cost_center.short_description = "Cost Center"
 
     def fmt_bank_info(self, obj):
@@ -6298,15 +6895,18 @@ class EmployeeAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             return mark_safe(
                 f'<div style="font-size:10px;"><b>{obj.bank_name}</b><br><span style="color:#666;">IBAN: {obj.iban or "—"}</span></div>')
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_bank_info.short_description = "Bank Info"
 
     def fmt_total_salary(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.total_salary:,.2f}</div>')
+
     fmt_total_salary.short_description = "Total Salary"
 
     def fmt_total_package(self, obj):
         total = obj.total_salary + obj.monthly_admin_cost
         return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#000080;">{total:,.2f}</div>')
+
     fmt_total_package.short_description = "Total Package"
 
     def fmt_eos(self, obj):
@@ -6322,16 +6922,19 @@ class EmployeeAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 f'<div style="text-align:right;font-weight:bold;color:#d32f2f;">{val:,.2f}</div>'
             )
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_eos.short_description = "EOS"
 
     def fmt_daily_cost(self, obj):
         return mark_safe(f'<div style="text-align:right;color:#2e7d32;font-weight:bold;">{obj.daily_cost:,.2f}</div>')
+
     fmt_daily_cost.short_description = "Daily Cost"
 
     def fmt_hourly_rate(self, obj):
         if obj.hourly_rate_ot > 0:
             return mark_safe(f'<div style="text-align:right;">{obj.hourly_rate_ot:,.2f}</div>')
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_hourly_rate.short_description = "Hourly Rate"
 
     def transfer_status(self, obj):
@@ -6343,6 +6946,7 @@ class EmployeeAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             t = active_transfers.first()
             return mark_safe(f'<b style="color:#ed6c02;">to {t.to_project.project_id_code}</b>')
         return mark_safe('<span style="color:#999;">—</span>')
+
     transfer_status.short_description = "Transfer"
 
     def changelist_view(self, request, extra_context=None):
@@ -6361,6 +6965,7 @@ class EmployeeAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                     )
                 )
         return super().changelist_view(request, extra_context)
+
 
 # =============================================================================
 # EMPLOYEE TRANSFER ADMIN (standalone for tree navigation)
@@ -6382,6 +6987,7 @@ class EmployeeTransferAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             elif db_field.name == 'employee':
                 kwargs['queryset'] = Employee.objects.filter(company=company)
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
+
 
 # =============================================================================
 # PAYROLL ADMIN
@@ -6436,6 +7042,7 @@ class PayrollCostCenterInline(admin.TabularInline):
                 amt = money(ot_hours * rate)
                 return mark_safe(f'<div style="text-align:right;font-weight:bold;">{amt:,.2f}</div>')
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_overtime_amount.short_description = "OT Amount"
 
     def get_queryset(self, request):
@@ -6444,6 +7051,7 @@ class PayrollCostCenterInline(admin.TabularInline):
         if company:
             qs = qs.filter(project__company=company)
         return qs
+
 
 class PayrollRecordAdminForm(forms.ModelForm):
     class Meta:
@@ -6469,6 +7077,7 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
     def fmt_total_salary(self, obj):
         return mark_safe(f'<div style="text-align:right;">{obj.total_salary_snap:,.2f}</div>')
+
     fmt_total_salary.short_description = "Total Salary"
 
     def fmt_overtime(self, obj):
@@ -6482,6 +7091,7 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 return mark_safe(f'<div style="text-align:right;">{cc_ot_hours}h / {ot_amount:,.2f}</div>')
             return mark_safe('<span style="color:#999;">—</span>')
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_overtime.short_description = "OT (Hrs/Amt)"
 
     def fmt_days_absent(self, obj):
@@ -6489,28 +7099,34 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         if days > 0:
             return mark_safe(f'<div style="text-align:right;color:#d32f2f;font-weight:bold;">{days}</div>')
         return mark_safe('<div style="text-align:right;color:#2e7d32;">0</div>')
+
     fmt_days_absent.short_description = "Abs Days"
 
     def fmt_absence(self, obj):
         return mark_safe(f'<div style="text-align:right;color:#d32f2f;">({obj.absence_deduction_snap:,.2f})</div>')
+
     fmt_absence.short_description = "Absence"
 
     def fmt_advance(self, obj):
         return mark_safe(f'<div style="text-align:right;color:#d32f2f;">({obj.salary_advance:,.2f})</div>')
+
     fmt_advance.short_description = "Advance"
 
     def fmt_other_ded(self, obj):
         return mark_safe(f'<div style="text-align:right;color:#d32f2f;">({obj.other_deduction:,.2f})</div>')
+
     fmt_other_ded.short_description = "Other Ded."
 
     def fmt_net_salary(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.net_salary_snap:,.2f}</div>')
+
     fmt_net_salary.short_description = "Net Salary"
 
     def allocation_status(self, obj):
         if obj.is_allocated:
             return mark_safe('<b style="color:#2e7d32;">ALLOCATED</b>')
         return mark_safe('<b style="color:#d32f2f;">PENDING</b>')
+
     allocation_status.short_description = "Status"
 
     def timesheet_button(self, obj):
@@ -6518,6 +7134,7 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         return format_html(
             '<a class="button" href="{}" target="_blank" style="background:#0288d1; color:white; padding: 2px 8px; border-radius: 4px; font-size:10px;">Time Sheet</a>',
             url)
+
     timesheet_button.short_description = "Sheet"
 
     def labor_cost_button(self, obj):
@@ -6525,6 +7142,7 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         return format_html(
             '<a class="button" href="{}" target="_blank" style="background:#6a1b9a; color:white; padding: 2px 8px; border-radius: 4px; font-size:10px;">Labor Cost</a>',
             url)
+
     labor_cost_button.short_description = "Cost Rpt"
 
     @admin.action(description="Allocate selected payroll to projects / BOQ items")
@@ -6548,13 +7166,13 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             rec.save()
         self.message_user(request, f"Recalculated {queryset.count()} record(s).")
 
-
     def changelist_view(self, request, extra_context=None):
         today = date.today()
         first_day = today.replace(day=1)
         last_month = (first_day - timedelta(days=1)).replace(day=1)
         company = self.get_active_company(request)
-        unallocated = PayrollRecord.objects.filter(month=last_month, is_allocated=False, employee__company=company).count()
+        unallocated = PayrollRecord.objects.filter(month=last_month, is_allocated=False,
+                                                   employee__company=company).count()
         if unallocated > 0:
             messages.warning(
                 request,
@@ -6576,103 +7194,103 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     def get_urls(self):
         urls = super().get_urls()
         custom = [
-                path("allocate/", self.admin_site.admin_view(self.allocate_view), name="payroll_allocate"),
-                path("reports/staff/", self.admin_site.admin_view(self.staff_report), name="payroll_staff_report"),
-                path("reports/wps/", self.admin_site.admin_view(self.wps_report), name="payroll_wps_report"),
-                path("reports/cash/", self.admin_site.admin_view(self.cash_report), name="payroll_cash_report"),
-                path("reports/labor-cost/", self.admin_site.admin_view(self.labor_cost_report),
-                     name="payroll_labor_cost"),
-                path('<int:pk>/timesheet/', self.admin_site.admin_view(self.timesheet_view), name='payroll_timesheet'),
-            ]
+            path("allocate/", self.admin_site.admin_view(self.allocate_view), name="payroll_allocate"),
+            path("reports/staff/", self.admin_site.admin_view(self.staff_report), name="payroll_staff_report"),
+            path("reports/wps/", self.admin_site.admin_view(self.wps_report), name="payroll_wps_report"),
+            path("reports/cash/", self.admin_site.admin_view(self.cash_report), name="payroll_cash_report"),
+            path("reports/labor-cost/", self.admin_site.admin_view(self.labor_cost_report),
+                 name="payroll_labor_cost"),
+            path('<int:pk>/timesheet/', self.admin_site.admin_view(self.timesheet_view), name='payroll_timesheet'),
+        ]
         return custom + urls
 
     def timesheet_view(self, request, pk):
-            company = self.get_active_company(request)
-            payroll = self.get_object_or_404_scoped(request, PayrollRecord, pk=pk)
-            emp = payroll.employee
-            logo_url = company.logo.url if company and company.logo else ''
+        company = self.get_active_company(request)
+        payroll = self.get_object_or_404_scoped(request, PayrollRecord, pk=pk)
+        emp = payroll.employee
+        logo_url = company.logo.url if company and company.logo else ''
 
-            month_start = payroll.month
-            if month_start.month == 12:
-                next_month = date(month_start.year + 1, 1, 1)
+        month_start = payroll.month
+        if month_start.month == 12:
+            next_month = date(month_start.year + 1, 1, 1)
+        else:
+            next_month = date(month_start.year, month_start.month + 1, 1)
+        month_end = next_month - timedelta(days=1)
+        days_in_month = month_end.day
+
+        cost_centers = list(PayrollCostCenter.objects.filter(
+            payroll_record=payroll
+        ).select_related('project'))
+
+        day_entries = []
+        for day_num in range(1, days_in_month + 1):
+            day_date = month_start.replace(day=day_num)
+            cc_for_day = None
+            for cc in cost_centers:
+                if cc.from_date <= day_date <= cc.to_date:
+                    cc_for_day = cc
+                    break
+
+            if cc_for_day:
+                is_last_day = (day_date == cc_for_day.to_date)
+                day_entries.append({
+                    'date': day_date,
+                    'project': cc_for_day.project,
+                    'status': 'Present',
+                    'status_color': '#2e7d32',
+                    'ot_hours': cc_for_day.overtime_hours if is_last_day else Decimal("0"),
+                    'bonus': cc_for_day.bonus if is_last_day else Decimal("0"),
+                    'is_last_day': is_last_day,
+                    'is_weekend': day_date.weekday() >= 5,
+                })
             else:
-                next_month = date(month_start.year, month_start.month + 1, 1)
-            month_end = next_month - timedelta(days=1)
-            days_in_month = month_end.day
-
-            cost_centers = list(PayrollCostCenter.objects.filter(
-                payroll_record=payroll
-            ).select_related('project'))
-
-            day_entries = []
-            for day_num in range(1, days_in_month + 1):
-                day_date = month_start.replace(day=day_num)
-                cc_for_day = None
-                for cc in cost_centers:
-                    if cc.from_date <= day_date <= cc.to_date:
-                        cc_for_day = cc
-                        break
-
-                if cc_for_day:
-                    is_last_day = (day_date == cc_for_day.to_date)
+                if emp.project:
                     day_entries.append({
                         'date': day_date,
-                        'project': cc_for_day.project,
+                        'project': emp.project,
                         'status': 'Present',
                         'status_color': '#2e7d32',
-                        'ot_hours': cc_for_day.overtime_hours if is_last_day else Decimal("0"),
-                        'bonus': cc_for_day.bonus if is_last_day else Decimal("0"),
-                        'is_last_day': is_last_day,
+                        'ot_hours': Decimal("0"),
+                        'bonus': Decimal("0"),
+                        'is_last_day': False,
                         'is_weekend': day_date.weekday() >= 5,
                     })
                 else:
-                    if emp.project:
-                        day_entries.append({
-                            'date': day_date,
-                            'project': emp.project,
-                            'status': 'Present',
-                            'status_color': '#2e7d32',
-                            'ot_hours': Decimal("0"),
-                            'bonus': Decimal("0"),
-                            'is_last_day': False,
-                            'is_weekend': day_date.weekday() >= 5,
-                        })
-                    else:
-                        day_entries.append({
-                            'date': day_date,
-                            'project': None,
-                            'status': 'Absent',
-                            'status_color': '#d32f2f',
-                            'ot_hours': Decimal("0"),
-                            'bonus': Decimal("0"),
-                            'is_last_day': False,
-                            'is_weekend': day_date.weekday() >= 5,
-                        })
+                    day_entries.append({
+                        'date': day_date,
+                        'project': None,
+                        'status': 'Absent',
+                        'status_color': '#d32f2f',
+                        'ot_hours': Decimal("0"),
+                        'bonus': Decimal("0"),
+                        'is_last_day': False,
+                        'is_weekend': day_date.weekday() >= 5,
+                    })
 
-            rows = ""
-            total_ot = Decimal("0")
-            total_bonus = Decimal("0")
-            present_days = 0
-            absent_days = 0
-            for entry in day_entries:
-                day_name = entry['date'].strftime('%a')
-                date_str = entry['date'].strftime('%d-%b-%Y')
-                proj_name = entry['project'].project_name if entry['project'] else '—'
-                proj_code = entry['project'].project_id_code if entry['project'] else ''
-                ot = money(entry['ot_hours'])
-                bonus = money(entry['bonus'])
-                total_ot += ot
-                total_bonus += bonus
-                if entry['status'] == 'Present':
-                    present_days += 1
-                else:
-                    absent_days += 1
+        rows = ""
+        total_ot = Decimal("0")
+        total_bonus = Decimal("0")
+        present_days = 0
+        absent_days = 0
+        for entry in day_entries:
+            day_name = entry['date'].strftime('%a')
+            date_str = entry['date'].strftime('%d-%b-%Y')
+            proj_name = entry['project'].project_name if entry['project'] else '—'
+            proj_code = entry['project'].project_id_code if entry['project'] else ''
+            ot = money(entry['ot_hours'])
+            bonus = money(entry['bonus'])
+            total_ot += ot
+            total_bonus += bonus
+            if entry['status'] == 'Present':
+                present_days += 1
+            else:
+                absent_days += 1
 
-                last_day_style = "background:#e8f5e9; font-weight:bold;" if entry['is_last_day'] else ""
-                weekend_style = "background:#f5f5f5;" if entry['is_weekend'] and not entry['is_last_day'] else ""
-                row_style = last_day_style or weekend_style
+            last_day_style = "background:#e8f5e9; font-weight:bold;" if entry['is_last_day'] else ""
+            weekend_style = "background:#f5f5f5;" if entry['is_weekend'] and not entry['is_last_day'] else ""
+            row_style = last_day_style or weekend_style
 
-                rows += f"""<tr style="{row_style}">
+            rows += f"""<tr style="{row_style}">
                     <td style="text-align:center; font-weight:bold;">{day_name}</td>
                     <td>{date_str}</td>
                     <td><b>{proj_code}</b> — {proj_name}</td>
@@ -6681,29 +7299,29 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                     <td style="text-align:right; font-weight:bold; color:#2e7d32;">{bonus:,.2f}</td>
                 </tr>"""
 
-            exact_ot = payroll.overtime_hours
-            exact_bonus = Decimal("0")
-            for cc in cost_centers:
-                exact_ot += cc.overtime_hours
-                exact_bonus += cc.bonus
+        exact_ot = payroll.overtime_hours
+        exact_bonus = Decimal("0")
+        for cc in cost_centers:
+            exact_ot += cc.overtime_hours
+            exact_bonus += cc.bonus
 
-            hourly_rate = emp.hourly_rate_ot if emp.employee_type == 'Site' else Decimal("0")
-            total_ot_amount = money(exact_ot * hourly_rate) if hourly_rate > 0 else Decimal("0")
-            total_extra = money(total_ot_amount + exact_bonus)
+        hourly_rate = emp.hourly_rate_ot if emp.employee_type == 'Site' else Decimal("0")
+        total_ot_amount = money(exact_ot * hourly_rate) if hourly_rate > 0 else Decimal("0")
+        total_extra = money(total_ot_amount + exact_bonus)
 
-            basic = payroll.basic_salary_snap
-            housing = payroll.housing_allowance_snap
-            transport = payroll.transport_allowance_snap
-            other = payroll.other_allowances_snap
-            total_salary = payroll.total_salary_snap
-            gross = money(total_salary + total_ot_amount + exact_bonus)
-            absence_ded = payroll.absence_deduction_snap
-            advance = payroll.salary_advance
-            other_ded = payroll.other_deduction
-            total_deductions = money(absence_ded + advance + other_ded)
-            net = payroll.net_salary_snap
+        basic = payroll.basic_salary_snap
+        housing = payroll.housing_allowance_snap
+        transport = payroll.transport_allowance_snap
+        other = payroll.other_allowances_snap
+        total_salary = payroll.total_salary_snap
+        gross = money(total_salary + total_ot_amount + exact_bonus)
+        absence_ded = payroll.absence_deduction_snap
+        advance = payroll.salary_advance
+        other_ded = payroll.other_deduction
+        total_deductions = money(absence_ded + advance + other_ded)
+        net = payroll.net_salary_snap
 
-            html = f"""<!DOCTYPE html>
+        html = f"""<!DOCTYPE html>
     <html><head><meta charset="UTF-8">
     <style>
         @page {{ size: A4 portrait; margin: 10mm; }}
@@ -6824,109 +7442,109 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         </div>
         <script>window.onload = function() {{ window.print(); }}</script>
     </body></html>"""
-            return HttpResponse(html)
+        return HttpResponse(html)
 
     def labor_cost_report(self, request):
-            from datetime import datetime
-            company = self.get_active_company(request)
-            month_str = request.GET.get("month")
-            if month_str:
-                try:
-                    month = datetime.strptime(month_str, "%Y-%m").date().replace(day=1)
-                except ValueError:
-                    month = date.today().replace(day=1)
-            else:
+        from datetime import datetime
+        company = self.get_active_company(request)
+        month_str = request.GET.get("month")
+        if month_str:
+            try:
+                month = datetime.strptime(month_str, "%Y-%m").date().replace(day=1)
+            except ValueError:
                 month = date.today().replace(day=1)
+        else:
+            month = date.today().replace(day=1)
 
-            last_day = calendar.monthrange(month.year, month.month)[1]
-            month_end = month.replace(day=last_day)
+        last_day = calendar.monthrange(month.year, month.month)[1]
+        month_end = month.replace(day=last_day)
 
-            logo_url = company.logo.url if company and company.logo else ''
+        logo_url = company.logo.url if company and company.logo else ''
 
-            records = PayrollRecord.objects.filter(
-                month=month, employee__company=company
-            ).select_related('employee').prefetch_related('cost_centers', 'cost_centers__project')
+        records = PayrollRecord.objects.filter(
+            month=month, employee__company=company
+        ).select_related('employee').prefetch_related('cost_centers', 'cost_centers__project')
 
-            projects = {}
-            for rec in records:
-                emp = rec.employee
-                cc_projects = set()
+        projects = {}
+        for rec in records:
+            emp = rec.employee
+            cc_projects = set()
 
-                for cc in rec.cost_centers.all():
-                    proj = cc.project
-                    cc_projects.add(proj.id)
-                    if proj not in projects:
-                        projects[proj] = []
+            for cc in rec.cost_centers.all():
+                proj = cc.project
+                cc_projects.add(proj.id)
+                if proj not in projects:
+                    projects[proj] = []
 
-                    cc_start = max(cc.from_date, month)
-                    cc_end = min(cc.to_date, month_end)
-                    days_in_month = (cc_end - cc_start).days + 1 if cc_start <= cc_end else 0
+                cc_start = max(cc.from_date, month)
+                cc_end = min(cc.to_date, month_end)
+                days_in_month = (cc_end - cc_start).days + 1 if cc_start <= cc_end else 0
 
-                    ot_amount = money(cc.overtime_hours * emp.hourly_rate_ot) if emp.hourly_rate_ot > 0 else Decimal(
-                        "0")
+                ot_amount = money(cc.overtime_hours * emp.hourly_rate_ot) if emp.hourly_rate_ot > 0 else Decimal(
+                    "0")
+
+                projects[proj].append({
+                    'employee': emp,
+                    'days': days_in_month,
+                    'daily_rate': rec.daily_rate,
+                    'daily_cost': rec.daily_cost,
+                    'salary_cost': cc.prorated_salary,
+                    'admin_cost': cc.prorated_admin_cost,
+                    'ot_hours': cc.overtime_hours,
+                    'ot_amount': ot_amount,
+                    'bonus': cc.bonus,
+                    'total_cost': money(cc.prorated_salary + cc.prorated_admin_cost + ot_amount + cc.bonus),
+                    'record': rec,
+                })
+
+            if emp.project and emp.project.id not in cc_projects:
+                proj = emp.project
+                if proj not in projects:
+                    projects[proj] = []
+
+                days_in_month = last_day - rec.days_absent
+                if days_in_month > 0:
+                    daily_rate = rec.daily_rate
+                    daily_cost = rec.daily_cost
+                    salary_cost = money(daily_rate * days_in_month)
+                    admin_cost = money((emp.monthly_admin_cost / Decimal("30")) * days_in_month)
 
                     projects[proj].append({
                         'employee': emp,
                         'days': days_in_month,
-                        'daily_rate': rec.daily_rate,
-                        'daily_cost': rec.daily_cost,
-                        'salary_cost': cc.prorated_salary,
-                        'admin_cost': cc.prorated_admin_cost,
-                        'ot_hours': cc.overtime_hours,
-                        'ot_amount': ot_amount,
-                        'bonus': cc.bonus,
-                        'total_cost': money(cc.prorated_salary + cc.prorated_admin_cost + ot_amount + cc.bonus),
+                        'daily_rate': daily_rate,
+                        'daily_cost': daily_cost,
+                        'salary_cost': salary_cost,
+                        'admin_cost': admin_cost,
+                        'ot_hours': Decimal("0"),
+                        'ot_amount': Decimal("0"),
+                        'bonus': Decimal("0"),
+                        'total_cost': money(salary_cost + admin_cost),
                         'record': rec,
                     })
 
-                if emp.project and emp.project.id not in cc_projects:
-                    proj = emp.project
-                    if proj not in projects:
-                        projects[proj] = []
+        sorted_projects = sorted(projects.items(), key=lambda x: x[0].project_id_code)
 
-                    days_in_month = last_day - rec.days_absent
-                    if days_in_month > 0:
-                        daily_rate = rec.daily_rate
-                        daily_cost = rec.daily_cost
-                        salary_cost = money(daily_rate * days_in_month)
-                        admin_cost = money((emp.monthly_admin_cost / Decimal("30")) * days_in_month)
+        project_cards = ""
+        grand_total = Decimal("0")
+        grand_salary = Decimal("0")
+        grand_admin = Decimal("0")
+        grand_ot = Decimal("0")
+        grand_bonus = Decimal("0")
 
-                        projects[proj].append({
-                            'employee': emp,
-                            'days': days_in_month,
-                            'daily_rate': daily_rate,
-                            'daily_cost': daily_cost,
-                            'salary_cost': salary_cost,
-                            'admin_cost': admin_cost,
-                            'ot_hours': Decimal("0"),
-                            'ot_amount': Decimal("0"),
-                            'bonus': Decimal("0"),
-                            'total_cost': money(salary_cost + admin_cost),
-                            'record': rec,
-                        })
+        for proj, employees in sorted_projects:
+            if not employees:
+                continue
 
-            sorted_projects = sorted(projects.items(), key=lambda x: x[0].project_id_code)
+            rows = ""
+            proj_total = Decimal("0")
+            proj_salary = Decimal("0")
+            proj_admin = Decimal("0")
+            proj_ot = Decimal("0")
+            proj_bonus = Decimal("0")
 
-            project_cards = ""
-            grand_total = Decimal("0")
-            grand_salary = Decimal("0")
-            grand_admin = Decimal("0")
-            grand_ot = Decimal("0")
-            grand_bonus = Decimal("0")
-
-            for proj, employees in sorted_projects:
-                if not employees:
-                    continue
-
-                rows = ""
-                proj_total = Decimal("0")
-                proj_salary = Decimal("0")
-                proj_admin = Decimal("0")
-                proj_ot = Decimal("0")
-                proj_bonus = Decimal("0")
-
-                for entry in employees:
-                    rows += f"""
+            for entry in employees:
+                rows += f"""
                     <tr>
                         <td style="text-align:center;"><b>{entry['employee'].employee_id}</b></td>
                         <td>{entry['employee'].name}</td>
@@ -6941,19 +7559,19 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                         <td class='num' style="font-weight:bold; color:#000080;">{entry['total_cost']:,.2f}</td>
                     </tr>
                     """
-                    proj_total += entry['total_cost']
-                    proj_salary += entry['salary_cost']
-                    proj_admin += entry['admin_cost']
-                    proj_ot += entry['ot_amount']
-                    proj_bonus += entry['bonus']
+                proj_total += entry['total_cost']
+                proj_salary += entry['salary_cost']
+                proj_admin += entry['admin_cost']
+                proj_ot += entry['ot_amount']
+                proj_bonus += entry['bonus']
 
-                grand_total += proj_total
-                grand_salary += proj_salary
-                grand_admin += proj_admin
-                grand_ot += proj_ot
-                grand_bonus += proj_bonus
+            grand_total += proj_total
+            grand_salary += proj_salary
+            grand_admin += proj_admin
+            grand_ot += proj_ot
+            grand_bonus += proj_bonus
 
-                project_cards += f"""
+            project_cards += f"""
                 <div class="project-card" style="margin-bottom:20px; border:1px solid #ccc; border-radius:8px; overflow:hidden; page-break-inside:avoid;">
                     <div style="background:#000080; color:white; padding:8px 12px; font-size:11px; font-weight:bold;">
                         {proj.project_id_code} — {proj.project_name}
@@ -6991,13 +7609,13 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 </div>
                 """
 
-            month_options = ""
-            for i in range(0, 12):
-                m = (date.today().replace(day=1) - timedelta(days=i * 30)).replace(day=1)
-                selected = "selected" if m == month else ""
-                month_options += f'<option value="{m.strftime("%Y-%m")}" {selected}>{m.strftime("%B %Y")}</option>'
+        month_options = ""
+        for i in range(0, 12):
+            m = (date.today().replace(day=1) - timedelta(days=i * 30)).replace(day=1)
+            selected = "selected" if m == month else ""
+            month_options += f'<option value="{m.strftime("%Y-%m")}" {selected}>{m.strftime("%B %Y")}</option>'
 
-            html = f"""<!DOCTYPE html>
+        html = f"""<!DOCTYPE html>
     <html><head><meta charset="UTF-8">
     <style>
         @page {{ size: A4 landscape; margin: 10mm; }}
@@ -7052,21 +7670,22 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         </div>
         <script>window.onload = function() {{ setTimeout(function() {{ window.print(); }}, 500); }}</script>
     </body></html>"""
-            return HttpResponse(html)
+        return HttpResponse(html)
 
     def _logo_bar(self, logo_url):
-            if logo_url:
-                return f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>'
-            return ''
-    def _payroll_report_wrapper(self, request, title, headers, rows, totals, payment_method):
-            company = self.get_active_company(request)
-            logo_url = company.logo.url if company and company.logo else ''
-            logo_bar_html = f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>' if logo_url else ''
+        if logo_url:
+            return f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>'
+        return ''
 
-            header_cells = "".join(f"<th>{h}</th>" for h in headers)
-            total_row = ""
-            if "basic" in totals:
-                total_row = f"""<tr class='total-row'>
+    def _payroll_report_wrapper(self, request, title, headers, rows, totals, payment_method):
+        company = self.get_active_company(request)
+        logo_url = company.logo.url if company and company.logo else ''
+        logo_bar_html = f'<div style="text-align:right; margin-bottom:6px;"><img src="{logo_url}" alt="Logo" style="max-height:120px; max-width:240px; object-fit:contain;"></div>' if logo_url else ''
+
+        header_cells = "".join(f"<th>{h}</th>" for h in headers)
+        total_row = ""
+        if "basic" in totals:
+            total_row = f"""<tr class='total-row'>
                     <td colspan='2'><b>TOTAL</b></td>
                     <td class='num'>{totals['basic']:,.2f}</td>
                     <td class='num'>{totals['housing']:,.2f}</td>
@@ -7078,8 +7697,8 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                     <td class='num'>({totals['other_ded']:,.2f})</td>
                     <td class='num'><b>{totals['net']:,.2f}</b></td>
                 </tr>"""
-            elif "ot" in totals:
-                total_row = f"""<tr class='total-row'>
+        elif "ot" in totals:
+            total_row = f"""<tr class='total-row'>
                     <td colspan='2'><b>TOTAL</b></td>
                     <td class='num'>{totals['total']:,.2f}</td>
                     <td></td>
@@ -7090,14 +7709,14 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                     <td class='num'>({totals['other_ded']:,.2f})</td>
                     <td class='num'><b>{totals['net']:,.2f}</b></td>
                 </tr>"""
-            else:
-                total_row = f"""<tr class='total-row'>
+        else:
+            total_row = f"""<tr class='total-row'>
                     <td colspan='4'><b>TOTAL</b></td>
                     <td class='num'><b>{totals['net']:,.2f}</b></td>
                     <td></td>
                 </tr>"""
 
-            return f"""<!DOCTYPE html>
+        return f"""<!DOCTYPE html>
     <html><head><meta charset="UTF-8">
     <style>
         @page {{ size: A4 portrait; margin: 10mm; }}
@@ -7271,33 +7890,33 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             return HttpResponse(html)
 
     def allocate_view(self, request):
-            today = date.today()
-            first_day = today.replace(day=1)
-            last_month = (first_day - timedelta(days=1)).replace(day=1)
-            company = self.get_active_company(request)
-            unallocated = PayrollRecord.objects.filter(
-                month=last_month, is_allocated=False, employee__company=company
-            ).select_related("employee")
+        today = date.today()
+        first_day = today.replace(day=1)
+        last_month = (first_day - timedelta(days=1)).replace(day=1)
+        company = self.get_active_company(request)
+        unallocated = PayrollRecord.objects.filter(
+            month=last_month, is_allocated=False, employee__company=company
+        ).select_related("employee")
 
-            if request.method == "POST":
-                action = request.POST.get("action")
-                if action == "yes":
-                    from .payroll import allocate_payroll
-                    done = 0
-                    for rec in unallocated:
-                        if allocate_payroll(rec):
-                            done += 1
-                    messages.success(request, f"{done} payroll record(s) allocated successfully.")
-                    return redirect("..")
-                else:
-                    messages.info(request, "Allocation postponed. You will be reminded again.")
-                    return redirect("..")
+        if request.method == "POST":
+            action = request.POST.get("action")
+            if action == "yes":
+                from .payroll import allocate_payroll
+                done = 0
+                for rec in unallocated:
+                    if allocate_payroll(rec):
+                        done += 1
+                messages.success(request, f"{done} payroll record(s) allocated successfully.")
+                return redirect("..")
+            else:
+                messages.info(request, "Allocation postponed. You will be reminded again.")
+                return redirect("..")
 
-            rows = ""
-            total_net = Decimal("0")
-            for rec in unallocated:
-                total_net += rec.net_salary_snap
-                rows += f"""<tr>
+        rows = ""
+        total_net = Decimal("0")
+        for rec in unallocated:
+            total_net += rec.net_salary_snap
+            rows += f"""<tr>
                     <td>{rec.employee.employee_id}</td>
                     <td>{rec.employee.name}</td>
                     <td>{rec.employee.get_employee_type_display()}</td>
@@ -7305,7 +7924,7 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                     <td class='num'>{rec.net_salary_snap:,.2f}</td>
                 </tr>"""
 
-            html = f"""<!DOCTYPE html>
+        html = f"""<!DOCTYPE html>
     <html><head><meta charset="UTF-8">
     <style>
         body {{ font-family: "Segoe UI", Arial, sans-serif; font-size: 12px; padding: 40px; background: #f5f5f5; }}
@@ -7349,7 +7968,8 @@ class PayrollRecordAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             </form>
         </div>
     </body></html>"""
-            return HttpResponse(html)
+        return HttpResponse(html)
+
 
 # =============================================================================
 # PRICING ADMIN
@@ -7371,7 +7991,6 @@ class PricingBOQItemInline(admin.TabularInline):
         return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
 
-
 # =============================================================================
 # SUPPLIER ADMIN
 # =============================================================================
@@ -7381,7 +8000,8 @@ class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.Mode
     company_field_path = 'company'
     list_display = [
         "name", "category", "contact_person", "payment_terms",
-        "fmt_total_payable", "fmt_credit_limit", "is_active", "aging_button"
+        "fmt_total_payable", "fmt_credit_limit", "is_active",
+        "statement_button", "outstanding_button", "aging_button"
     ]
     list_filter = ["company", "category", "is_active", "payment_terms"]
     search_fields = ["name", "contact_person", "trn_number", "email"]
@@ -7396,16 +8016,11 @@ class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.Mode
             "fields": ("payment_terms", "credit_limit")
         }),
         ("Banking Details", {
-            "fields": ("bank_name", "account_name", "account_number", "iban", "swift_code"),
+            "fields": ("bank_name", "account_name", "account_number", "IBAN", "SWIFT_code"),
             "classes": ("collapse",)
         }),
         ("Notes", {
             "fields": ("notes",),
-            "classes": ("collapse",)
-        }),
-        ("Linked Expense", {
-            "fields": ("linked_expense_display",),
-            "description": "Auto-generated expense record linked to this invoice",
             "classes": ("collapse",)
         }),
     )
@@ -7415,6 +8030,7 @@ class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.Mode
         if total > 0:
             return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#c62828;">{total:,.2f}</div>')
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_total_payable.short_description = "Total Payable"
 
     def fmt_credit_limit(self, obj):
@@ -7427,23 +8043,438 @@ class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.Mode
                 f'<div style="font-size:8px;color:#666;">{usage:.0f}% used</div>'
             )
         return mark_safe('<span style="color:#999;">—</span>')
+
     fmt_credit_limit.short_description = "Credit Limit"
+
+    def statement_button(self, obj):
+        url = reverse('admin:supplier_statement', args=[obj.pk])
+        return format_html(
+            '<a class="button" href="{}" target="_blank" style="background:#1a237e; color:white; padding:2px 8px; '
+            'border-radius:4px; font-size:10px; text-decoration:none; font-weight:600;">📄 Statement</a>',
+            url
+        )
+
+    statement_button.short_description = "Stmt"
+
+    def outstanding_button(self, obj):
+        url = reverse('admin:supplier_outstanding', args=[obj.pk])
+        return format_html(
+            '<a class="button" href="{}" target="_blank" style="background:#c62828; color:white; padding:2px 8px; '
+            'border-radius:4px; font-size:10px; text-decoration:none; font-weight:600;">⚠️ Outstanding</a>',
+            url
+        )
+
+    outstanding_button.short_description = "OS"
 
     def aging_button(self, obj):
         url = reverse('admin:supplier_aging', args=[obj.pk])
         return format_html(
-            '<a class="button" href="{}" target="_blank" style="background:#1a237e; color:white; padding:2px 8px; '
+            '<a class="button" href="{}" target="_blank" style="background:#00695c; color:white; padding:2px 8px; '
             'border-radius:4px; font-size:10px; text-decoration:none; font-weight:600;">📊 Aging</a>',
             url
         )
-    aging_button.short_description = "Report"
+
+    aging_button.short_description = "Aging"
 
     def get_urls(self):
         urls = super().get_urls()
         custom = [
+            path('<int:pk>/statement/', self.admin_site.admin_view(self.supplier_statement_view),
+                 name='supplier_statement'),
+            path('<int:pk>/outstanding/', self.admin_site.admin_view(self.supplier_outstanding_view),
+                 name='supplier_outstanding'),
             path('<int:pk>/aging/', self.admin_site.admin_view(self.aging_view), name='supplier_aging'),
         ]
         return custom + urls
+
+    # ========== SUPPLIER STATEMENT OF ACCOUNT ==========
+    def supplier_statement_view(self, request, pk):
+        company = self.get_active_company(request)
+        supplier = self.get_object_or_404_scoped(request, Supplier, pk=pk)
+        logo_url = company.logo.url if company and company.logo else ''
+
+        invoices = SupplierInvoice.objects.filter(
+            supplier=supplier
+        ).exclude(status='Cancelled').order_by('invoice_date', 'id')
+
+        if company:
+            invoices = invoices.filter(company=company)
+
+        rows = ""
+        grand_total = Decimal("0")
+        grand_paid = Decimal("0")
+        grand_balance = Decimal("0")
+        grand_vat = Decimal("0")
+
+        for inv in invoices:
+            total = inv.total_amount
+            paid = inv.paid_amount + inv.client_paid_total
+            balance = inv.balance_due
+            vat = total - inv.amount
+
+            grand_total += total
+            grand_paid += paid
+            grand_balance += balance
+            grand_vat += vat
+
+            days_overdue = (date.today() - inv.due_date).days if inv.due_date and inv.status != 'Paid' else 0
+
+            if inv.status == 'Paid':
+                status_badge = '<span class="badge badge-success">Paid</span>'
+                aging = '<span class="badge badge-success">Settled</span>'
+            elif inv.status == 'Draft':
+                status_badge = '<span class="badge badge-warning">Draft</span>'
+                aging = f'<span class="badge badge-info">{days_overdue}d</span>' if days_overdue > 0 else '<span class="badge badge-info">Current</span>'
+            else:
+                status_badge = '<span class="badge badge-info">Approved</span>'
+                if days_overdue > 90:
+                    aging = f'<span class="badge badge-danger">{days_overdue}d overdue</span>'
+                elif days_overdue > 30:
+                    aging = f'<span class="badge badge-warning">{days_overdue}d overdue</span>'
+                elif days_overdue > 0:
+                    aging = f'<span class="badge badge-info">{days_overdue}d overdue</span>'
+                else:
+                    aging = '<span class="badge badge-success">Current</span>'
+
+            # Client paid indicator
+            client_paid_html = ""
+            if inv.client_paid_total > 0:
+                client_paid_html = f'<div style="font-size:8px; color:#6a1b9a;">+{inv.client_paid_total:,.2f} client-paid</div>'
+
+            rows += f"""
+            <tr>
+                <td class="center">{inv.invoice_date.strftime('%d-%b-%Y')}</td>
+                <td class="center">{inv.supplier_inv_number}</td>
+                <td class="text">{inv.description[:80]}</td>
+                <td class="center">{inv.project.project_name if inv.project else 'Overhead'}</td>
+                <td class="center">{status_badge}</td>
+                <td class="center">{inv.due_date.strftime('%d-%b-%Y') if inv.due_date else '—'}</td>
+                <td class="num">{inv.amount:,.2f}</td>
+                <td class="num">{vat:,.2f}</td>
+                <td class="num font-bold">{total:,.2f}</td>
+                <td class="num text-success">{paid:,.2f}{client_paid_html}</td>
+                <td class="num font-bold {'text-danger' if balance > 0 else 'text-success'}">{balance:,.2f}</td>
+                <td class="center">{aging}</td>
+            </tr>
+            """
+
+        # Aging summary
+        aging_summary = {
+            'Current': Decimal("0"), '1-30 Days': Decimal("0"),
+            '31-60 Days': Decimal("0"), '61-90 Days': Decimal("0"), '90+ Days': Decimal("0")
+        }
+        for inv in invoices.exclude(status='Paid'):
+            bucket = inv.aging_bucket
+            if bucket in aging_summary:
+                aging_summary[bucket] += inv.balance_due
+
+        aging_cards = ""
+        aging_colors = {
+            'Current': ('#2e7d32', '#e8f5e9'),
+            '1-30 Days': ('#f57c00', '#fff3e0'),
+            '31-60 Days': ('#ed6c02', '#ffe0b2'),
+            '61-90 Days': ('#d32f2f', '#ffcdd2'),
+            '90+ Days': ('#c62828', '#ffebee'),
+        }
+        for bucket, amount in aging_summary.items():
+            color, bg = aging_colors[bucket]
+            aging_cards += f"""
+            <div class="metric-card" style="border-left: 4px solid {color}; background: {bg};">
+                <div class="metric-value" style="color: {color};">{amount:,.2f}</div>
+                <div class="metric-label">{bucket}</div>
+            </div>
+            """
+
+        body = f"""
+        {self._build_meta_grid({
+            'Supplier': supplier.name,
+            'Category': supplier.get_category_display() if hasattr(supplier, 'get_category_display') else supplier.category,
+            'TRN': supplier.trn_number or 'N/A',
+            'Credit Limit': f"AED {supplier.credit_limit:,.2f}" if supplier.credit_limit else 'N/A',
+            'Payment Terms': f"{supplier.payment_terms} days" if supplier.payment_terms else 'N/A',
+            'Report Date': date.today().strftime('%d-%b-%Y'),
+        })}
+
+        <!-- Aging Summary Cards -->
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-header" style="color: #1a237e; border-color: #c5cae9;">
+                <span class="icon">📊</span> AGING SUMMARY
+            </div>
+            <div class="grid-5">
+                {aging_cards}
+            </div>
+        </div>
+
+        <!-- Statement Table -->
+        <div class="card">
+            <div class="card-header">
+                <span class="icon">📋</span> STATEMENT OF ACCOUNT
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Inv #</th>
+                        <th>Description</th>
+                        <th>Project</th>
+                        <th>Status</th>
+                        <th>Due Date</th>
+                        <th class="num">Net</th>
+                        <th class="num">VAT</th>
+                        <th class="num">Total</th>
+                        <th class="num">Paid</th>
+                        <th class="num">Balance</th>
+                        <th>Aging</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows if rows else '<tr><td colspan="12" style="text-align:center; color:#999; padding:20px;">No invoices found</td></tr>'}
+                </tbody>
+                <tfoot>
+                    <tr class="grand-total">
+                        <td colspan="6"><b>GRAND TOTAL</b></td>
+                        <td class="num"><b>{grand_total - grand_vat:,.2f}</b></td>
+                        <td class="num"><b>{grand_vat:,.2f}</b></td>
+                        <td class="num"><b>{grand_total:,.2f}</b></td>
+                        <td class="num"><b>{grand_paid:,.2f}</b></td>
+                        <td class="num"><b>{grand_balance:,.2f}</b></td>
+                        <td></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+
+        <!-- Summary Metrics -->
+        <div class="grid-4" style="margin-top: 20px;">
+            <div class="metric-card">
+                <div class="metric-value text-primary">{grand_total:,.2f}</div>
+                <div class="metric-label">Total Invoiced</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value text-success">{grand_paid:,.2f}</div>
+                <div class="metric-label">Total Paid</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value text-danger">{grand_balance:,.2f}</div>
+                <div class="metric-label">Total Balance</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value text-warning">{invoices.exclude(status='Paid').count()}</div>
+                <div class="metric-label">Open Invoices</div>
+            </div>
+        </div>
+
+        <!-- Signatures -->
+        <div class="signature-grid" style="margin-top: 40px;">
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Prepared By</div></div>
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Finance Director</div></div>
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Date</div></div>
+        </div>
+        """
+
+        return HttpResponse(self._report_base_wrapper(
+            "SUPPLIER STATEMENT OF ACCOUNT",
+            f"Accounts Payable Ledger — {supplier.name}",
+            body,
+            logo_url
+        ))
+
+    # ========== SUPPLIER OUTSTANDING REPORT ==========
+    def supplier_outstanding_view(self, request, pk):
+        company = self.get_active_company(request)
+        supplier = self.get_object_or_404_scoped(request, Supplier, pk=pk)
+        logo_url = company.logo.url if company and company.logo else ''
+
+        invoices = SupplierInvoice.objects.filter(
+            supplier=supplier
+        ).exclude(status='Paid').exclude(status='Cancelled').order_by('due_date')
+
+        if company:
+            invoices = invoices.filter(company=company)
+
+        # Separate by aging bucket
+        current_rows = ""
+        overdue_rows = ""
+        total_current = Decimal("0")
+        total_overdue = Decimal("0")
+        total_1_30 = Decimal("0")
+        total_31_60 = Decimal("0")
+        total_61_90 = Decimal("0")
+        total_90plus = Decimal("0")
+
+        for inv in invoices:
+            balance = inv.balance_due
+            days_overdue = (date.today() - inv.due_date).days if inv.due_date else 0
+
+            status_badge = '<span class="badge badge-warning">Draft</span>' if inv.status == 'Draft' else '<span class="badge badge-info">Approved</span>'
+
+            # Client paid indicator
+            client_paid_html = ""
+            if inv.client_paid_total > 0:
+                client_paid_html = f'<div style="font-size:8px; color:#6a1b9a;">Client-paid: {inv.client_paid_total:,.2f}</div>'
+
+            row = f"""
+            <tr>
+                <td class="center">{inv.invoice_date.strftime('%d-%b-%Y')}</td>
+                <td class="center">{inv.supplier_inv_number}</td>
+                <td class="text">{inv.description[:80]}</td>
+                <td class="center">{inv.project.project_name if inv.project else 'Overhead'}</td>
+                <td class="center">{status_badge}</td>
+                <td class="center">{inv.due_date.strftime('%d-%b-%Y') if inv.due_date else '—'}</td>
+                <td class="center"><span class="badge badge-danger">{days_overdue}d</span></td>
+                <td class="num font-bold text-danger">{balance:,.2f}</td>
+                <td class="center">{client_paid_html}</td>
+            </tr>
+            """
+
+            if days_overdue <= 0:
+                current_rows += row
+                total_current += balance
+            else:
+                overdue_rows += row
+                total_overdue += balance
+                if days_overdue <= 30:
+                    total_1_30 += balance
+                elif days_overdue <= 60:
+                    total_31_60 += balance
+                elif days_overdue <= 90:
+                    total_61_90 += balance
+                else:
+                    total_90plus += balance
+
+        body = f"""
+        {self._build_meta_grid({
+            'Supplier': supplier.name,
+            'Category': supplier.get_category_display() if hasattr(supplier, 'get_category_display') else supplier.category,
+            'TRN': supplier.trn_number or 'N/A',
+            'Credit Limit': f"AED {supplier.credit_limit:,.2f}" if supplier.credit_limit else 'N/A',
+            'Report Date': date.today().strftime('%d-%b-%Y'),
+        })}
+
+        <!-- Risk Alert -->
+        <div style="background: {'#c62828' if total_overdue > total_current else '#ed6c02' if total_overdue > 0 else '#2e7d32'}; color: white; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; text-align: center;">
+            <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.9; margin-bottom: 4px;">Outstanding Balance Risk</div>
+            <div style="font-size: 22px; font-weight: 700;">AED {total_current + total_overdue:,.2f}</div>
+            <div style="font-size: 10px; opacity: 0.8; margin-top: 4px;">
+                Current: AED {total_current:,.2f} | Overdue: AED {total_overdue:,.2f}
+            </div>
+        </div>
+
+        <!-- Aging Breakdown -->
+        <div class="card" style="margin-bottom: 20px;">
+            <div class="card-header" style="color: #c62828; border-color: #ffcdd2;">
+                <span class="icon">⚠️</span> OVERDUE BREAKDOWN
+            </div>
+            <div class="grid-5">
+                <div class="metric-card" style="border-left: 4px solid #2e7d32;">
+                    <div class="metric-value text-success">{total_current:,.2f}</div>
+                    <div class="metric-label">Current</div>
+                </div>
+                <div class="metric-card" style="border-left: 4px solid #f57c00;">
+                    <div class="metric-value text-warning">{total_1_30:,.2f}</div>
+                    <div class="metric-label">1-30 Days</div>
+                </div>
+                <div class="metric-card" style="border-left: 4px solid #ed6c02;">
+                    <div class="metric-value" style="color: #ed6c02;">{total_31_60:,.2f}</div>
+                    <div class="metric-label">31-60 Days</div>
+                </div>
+                <div class="metric-card" style="border-left: 4px solid #d32f2f;">
+                    <div class="metric-value text-danger">{total_61_90:,.2f}</div>
+                    <div class="metric-label">61-90 Days</div>
+                </div>
+                <div class="metric-card" style="border-left: 4px solid #c62828;">
+                    <div class="metric-value" style="color: #c62828;">{total_90plus:,.2f}</div>
+                    <div class="metric-label">90+ Days</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Current Invoices -->
+        <div class="card" style="margin-bottom: 16px;">
+            <div class="card-header" style="color: #2e7d32; border-color: #c8e6c9;">
+                <span class="icon">✅</span> CURRENT INVOICES
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Inv #</th>
+                        <th>Description</th>
+                        <th>Project</th>
+                        <th>Status</th>
+                        <th>Due Date</th>
+                        <th>Days</th>
+                        <th class="num">Balance</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {current_rows if current_rows else '<tr><td colspan="9" style="text-align:center; color:#999; padding:20px;">No current invoices</td></tr>'}
+                </tbody>
+                <tfoot>
+                    <tr class="total-row">
+                        <td colspan="7"><b>CURRENT TOTAL</b></td>
+                        <td class="num text-success"><b>{total_current:,.2f}</b></td>
+                        <td></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+
+        <!-- Overdue Invoices -->
+        <div class="card" style="margin-bottom: 16px;">
+            <div class="card-header" style="color: #c62828; border-color: #ffcdd2;">
+                <span class="icon">⚠️</span> OVERDUE INVOICES
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Date</th>
+                        <th>Inv #</th>
+                        <th>Description</th>
+                        <th>Project</th>
+                        <th>Status</th>
+                        <th>Due Date</th>
+                        <th>Overdue</th>
+                        <th class="num">Balance</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {overdue_rows if overdue_rows else '<tr><td colspan="9" style="text-align:center; color:#999; padding:20px;">No overdue invoices</td></tr>'}
+                </tbody>
+                <tfoot>
+                    <tr class="total-row">
+                        <td colspan="7"><b>OVERDUE TOTAL</b></td>
+                        <td class="num text-danger"><b>{total_overdue:,.2f}</b></td>
+                        <td></td>
+                    </tr>
+                </tfoot>
+            </table>
+        </div>
+
+        <!-- Grand Total -->
+        <div class="card" style="background: #1a237e; color: white;">
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 16px;">
+                <div style="font-size: 14px; font-weight: 700;">GRAND TOTAL OUTSTANDING</div>
+                <div style="font-size: 24px; font-weight: 700;">AED {total_current + total_overdue:,.2f}</div>
+            </div>
+        </div>
+
+        <!-- Signatures -->
+        <div class="signature-grid" style="margin-top: 40px;">
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Prepared By</div></div>
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Finance Director</div></div>
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Date</div></div>
+        </div>
+        """
+
+        return HttpResponse(self._report_base_wrapper(
+            "SUPPLIER OUTSTANDING REPORT",
+            f"Unpaid Invoices — {supplier.name}",
+            body,
+            logo_url
+        ))
 
     def aging_view(self, request, pk):
         """Supplier Aging Report"""
@@ -7484,39 +8515,39 @@ class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.Mode
             '90+ Days': ('#c62828', '#ffebee'),
         }
 
-        for bucket_name, inv_list in buckets.items():
+        for bucket, inv_list in buckets.items():
             if not inv_list:
                 continue
-            color, bg = colors[bucket_name]
+            color, bg = colors[bucket]
             rows = ""
             for inv in inv_list:
+                days = (date.today() - inv.due_date).days if inv.due_date else 0
                 rows += f"""
                 <tr>
-                    <td class="center">{inv.supplier_inv_number}</td>
                     <td class="center">{inv.invoice_date.strftime('%d-%b-%Y')}</td>
-                    <td class="center">{inv.due_date.strftime('%d-%b-%Y')}</td>
+                    <td class="center">{inv.supplier_inv_number}</td>
                     <td class="text">{inv.description[:60]}</td>
+                    <td class="center">{inv.project.project_name if inv.project else 'Overhead'}</td>
                     <td class="num">{inv.total_amount:,.2f}</td>
                     <td class="num text-success">{inv.paid_amount:,.2f}</td>
                     <td class="num font-bold text-danger">{inv.balance_due:,.2f}</td>
-                    <td class="center"><span class="badge badge-warning">{inv.days_overdue} days</span></td>
+                    <td class="center"><span class="badge badge-danger">{days}d</span></td>
                 </tr>
                 """
-
             bucket_html += f"""
-            <div class="card" style="margin-bottom: 16px; border-left: 4px solid {color};">
-                <div class="card-header" style="color: {color}; border-color: {color};">
-                    <span class="icon">⏱️</span> {bucket_name} 
+            <div class="card" style="margin-bottom: 12px; border-left: 4px solid {color};">
+                <div class="card-header" style="color: {color}; border-color: {bg};">
+                    <span class="icon">📁</span> {bucket}
                     <span class="badge badge-danger" style="margin-left: 10px;">{len(inv_list)} invoices</span>
-                    <span style="float: right; color: {color}; font-weight: bold;">AED {bucket_totals[bucket_name]:,.2f}</span>
+                    <span style="float: right; font-weight: bold;">AED {bucket_totals[bucket]:,.2f}</span>
                 </div>
                 <table class="data-table" style="margin: 0;">
                     <thead>
                         <tr>
+                            <th>Date</th>
                             <th>Inv #</th>
-                            <th>Inv Date</th>
-                            <th>Due Date</th>
                             <th>Description</th>
+                            <th>Project</th>
                             <th class="num">Total</th>
                             <th class="num">Paid</th>
                             <th class="num">Balance</th>
@@ -7526,10 +8557,10 @@ class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.Mode
                     <tbody>{rows}</tbody>
                     <tfoot>
                         <tr style="background: {bg}; font-weight: bold;">
-                            <td colspan="4"><b>{bucket_name} TOTAL</b></td>
-                            <td class="num">—</td>
-                            <td class="num">—</td>
-                            <td class="num text-danger"><b>{bucket_totals[bucket_name]:,.2f}</b></td>
+                            <td colspan="4"><b>{bucket} TOTAL</b></td>
+                            <td></td>
+                            <td></td>
+                            <td class="num text-danger"><b>{bucket_totals[bucket]:,.2f}</b></td>
                             <td></td>
                         </tr>
                     </tfoot>
@@ -7537,62 +8568,132 @@ class SupplierAdmin(ProfessionalReportMixin, CompanyScopedAdminMixin, admin.Mode
             </div>
             """
 
-        grand_total = sum(bucket_totals.values())
+        # Client-paid invoices section
+        client_paid_invoice_ids = ClientDeduction.objects.filter(
+            supplier_payment__supplier_invoice__supplier=supplier
+        ).values_list('supplier_payment__supplier_invoice', flat=True).distinct()
+
+        client_paid_invoices = SupplierInvoice.objects.filter(
+            id__in=client_paid_invoice_ids
+        )
+
+        client_paid_section = ""
+        if client_paid_invoices.exists():
+            cp_rows = ""
+            cp_total_net = Decimal("0")
+            cp_total_vat = Decimal("0")
+            cp_total_gross = Decimal("0")
+
+            for inv in client_paid_invoices:
+                net = inv.client_paid_amount
+                vat = inv.client_paid_vat
+                gross = inv.client_paid_total
+                cp_total_net += net
+                cp_total_vat += vat
+                cp_total_gross += gross
+
+                cp_rows += f"""
+                <tr>
+                    <td class="center">{inv.supplier_inv_number}</td>
+                    <td class="center">{inv.invoice_date.strftime('%d-%b-%Y')}</td>
+                    <td class="text">{inv.description[:60]}</td>
+                    <td class="num">{inv.total_amount:,.2f}</td>
+                    <td class="num text-danger">({net:,.2f})</td>
+                    <td class="num text-danger">({vat:,.2f})</td>
+                    <td class="num font-bold text-danger">({gross:,.2f})</td>
+                    <td class="center"><span class="badge badge-info">Client Paid</span></td>
+                </tr>
+                """
+
+            client_paid_section = f"""
+            <div class="card" style="margin-bottom: 20px; border-left: 4px solid #6a1b9a;">
+                <div class="card-header" style="color: #6a1b9a; border-color: #e1bee7;">
+                    <span class="icon">💰</span> CLIENT-PAID INVOICES
+                    <span class="badge badge-primary" style="margin-left: 10px;">
+                        {client_paid_invoices.count()} invoices
+                    </span>
+                </div>
+                <table class="data-table" style="margin: 0;">
+                    <thead>
+                        <tr>
+                            <th>Inv #</th>
+                            <th>Date</th>
+                            <th>Description</th>
+                            <th class="num">Total Inv</th>
+                            <th class="num">Net Paid</th>
+                            <th class="num">VAT</th>
+                            <th class="num">Gross Paid</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>{cp_rows}</tbody>
+                    <tfoot>
+                        <tr style="background: #e1bee7; font-weight: bold;">
+                            <td colspan="4"><b>TOTAL CLIENT-PAID</b></td>
+                            <td class="num text-danger"><b>({cp_total_net:,.2f})</b></td>
+                            <td class="num text-danger"><b>({cp_total_vat:,.2f})</b></td>
+                            <td class="num font-bold text-danger"><b>({cp_total_gross:,.2f})</b></td>
+                            <td></td>
+                        </tr>
+                    </tfoot>
+                </table>
+            </div>
+            """
+
+        total_outstanding = sum(bucket_totals.values())
 
         body = f"""
         {self._build_meta_grid({
             'Supplier': supplier.name,
-            'Category': supplier.get_category_display(),
+            'Category': supplier.get_category_display() if hasattr(supplier, 'get_category_display') else supplier.category,
             'TRN': supplier.trn_number or 'N/A',
-            'Payment Terms': f"{supplier.payment_terms} days",
-            'Credit Limit': f"AED {supplier.credit_limit:,.2f}" if supplier.credit_limit > 0 else 'N/A',
+            'Credit Limit': f"AED {supplier.credit_limit:,.2f}" if supplier.credit_limit else 'N/A',
+            'Payment Terms': f"{supplier.payment_terms} days" if supplier.payment_terms else 'N/A',
             'Report Date': date.today().strftime('%d-%b-%Y'),
         })}
 
+        <!-- Executive Summary -->
         <div class="card" style="background: linear-gradient(135deg, #1a237e 0%, #283593 100%); color: white; margin-bottom: 20px;">
             <div class="card-header" style="color: white; border-color: rgba(255,255,255,0.3);">
-                <span class="icon">📊</span> SUPPLIER AGING SUMMARY
+                <span class="icon">📊</span> AGING SUMMARY
             </div>
             <div class="grid-5">
                 <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
-                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['Current']:,.2f}</div>
+                    <div class="metric-value" style="color: white;">{bucket_totals['Current']:,.2f}</div>
                     <div class="metric-label" style="color: rgba(255,255,255,0.9);">Current</div>
                 </div>
                 <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
-                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['1-30 Days']:,.2f}</div>
+                    <div class="metric-value" style="color: white;">{bucket_totals['1-30 Days']:,.2f}</div>
                     <div class="metric-label" style="color: rgba(255,255,255,0.9);">1-30 Days</div>
                 </div>
                 <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
-                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['31-60 Days']:,.2f}</div>
+                    <div class="metric-value" style="color: white;">{bucket_totals['31-60 Days']:,.2f}</div>
                     <div class="metric-label" style="color: rgba(255,255,255,0.9);">31-60 Days</div>
                 </div>
                 <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
-                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['61-90 Days']:,.2f}</div>
+                    <div class="metric-value" style="color: white;">{bucket_totals['61-90 Days']:,.2f}</div>
                     <div class="metric-label" style="color: rgba(255,255,255,0.9);">61-90 Days</div>
                 </div>
                 <div class="metric-card" style="background: rgba(255,255,255,0.15); border: none; color: white;">
-                    <div class="metric-value" style="color: white; font-size: 20px;">{bucket_totals['90+ Days']:,.2f}</div>
+                    <div class="metric-value" style="color: white;">{bucket_totals['90+ Days']:,.2f}</div>
                     <div class="metric-label" style="color: rgba(255,255,255,0.9);">90+ Days</div>
                 </div>
             </div>
             <div style="text-align: center; margin-top: 16px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,0.2);">
-                <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8;">TOTAL OUTSTANDING</div>
-                <div style="font-size: 28px; font-weight: 700;">AED {grand_total:,.2f}</div>
+                <div style="font-size: 11px; text-transform: uppercase; letter-spacing: 1px; opacity: 0.8; margin-bottom: 8px;">Total Outstanding</div>
+                <div style="font-size: 28px; font-weight: 700;">AED {total_outstanding:,.2f}</div>
             </div>
         </div>
 
-        {bucket_html if bucket_html else '<div class="card" style="text-align:center; padding:40px; color:#666;"><p>No outstanding invoices for this supplier.</p></div>'}
+        {client_paid_section}
 
+        {bucket_html if bucket_html else '<div class="card" style="text-align:center; padding:40px; color:#666;"><p>No outstanding invoices.</p></div>'}
+
+        <!-- Signatures -->
         <div class="signature-grid" style="margin-top: 40px;">
-            <div class="signature-block">
-                <div style="font-size: 8px; color: #666; margin-top: 4px;">Finance Director</div>
-            </div>
-            <div class="signature-block">
-                <div style="font-size: 8px; color: #666; margin-top: 4px;">Procurement Manager</div>
-            </div>
-            <div class="signature-block">
-                <div style="font-size: 8px; color: #666; margin-top: 4px;">General Manager</div>
-            </div>
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Prepared By</div></div>
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Finance Director</div></div>
+            <div class="signature-block"><div style="font-size: 8px; color: #666; margin-top: 4px;">Date</div></div>
         </div>
         """
 
@@ -7622,7 +8723,12 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         "supplier_inv_number", "supplier", "project", "fmt_amount",
         "fmt_total", "fmt_balance", "status_badge", "due_date",
         "days_overdue_display", "expected_payment_date", "is_recurring",
-        "linked_expense_count",
+        "linked_expense_count", "payment_status",
+        "client_deductions_display", "adjusted_balance_display",
+    ]
+
+    readonly_fields = [
+        "client_paid_amount", "client_paid_vat", "client_paid_total", "adjusted_balance_due",
     ]
 
     list_filter = [
@@ -7639,7 +8745,7 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 ("company", "supplier"),
                 ("supplier_inv_number", "reference_number"),
                 "description",
-                ("project", "boq_item", "expense_category"),
+                ("project", "boq_item", "expense_category", "sub_expense"),
             )
         }),
         ("Amounts", {
@@ -7661,6 +8767,8 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         ("Payment Tracking", {
             "fields": (
                 ("paid_amount", "actual_payment_date"),
+                ("client_paid_amount", "client_paid_vat", "client_paid_total"),
+                ("adjusted_balance_due",),
             ),
             "classes": ("collapse",)
         }),
@@ -7677,11 +8785,11 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             'billing/js/supplier_invoice_boq_filter.js',
         )
 
+    # FIX: Merge both formfield_for_foreignkey methods into ONE, add sub_expense handling
     def formfield_for_foreignkey(self, db_field, request, **kwargs):
         company = self.get_active_company(request)
 
         if db_field.name == 'boq_item':
-            # Get project from existing object
             project_id = None
             if hasattr(request, '_supplier_invoice_project_id'):
                 project_id = request._supplier_invoice_project_id
@@ -7694,7 +8802,6 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                     except SupplierInvoice.DoesNotExist:
                         pass
 
-            # Also check POST data
             if not project_id and request.method == 'POST':
                 project_id = request.POST.get('project')
 
@@ -7708,11 +8815,35 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
                 kwargs['queryset'] = Project.objects.filter(
                     Q(company=company) | Q(company__isnull=True)
                 )
+
         elif db_field.name == 'expense_category':
             if company:
                 kwargs['queryset'] = ExpenseCategory.objects.filter(
                     Q(company=company) | Q(company__isnull=True)
                 )
+
+        # NEW: Add sub_expense filtering based on selected expense_category
+        elif db_field.name == 'sub_expense':
+            # Try to get category from existing object
+            category_id = None
+            if request.resolver_match and hasattr(request.resolver_match, 'kwargs'):
+                object_id = request.resolver_match.kwargs.get('object_id')
+                if object_id:
+                    try:
+                        obj = SupplierInvoice.objects.get(pk=object_id)
+                        category_id = obj.expense_category_id
+                    except SupplierInvoice.DoesNotExist:
+                        pass
+
+            # Also check POST data for new objects
+            if not category_id and request.method == 'POST':
+                category_id = request.POST.get('expense_category')
+
+            if category_id:
+                kwargs['queryset'] = SubExpense.objects.filter(parent_id=category_id)
+            else:
+                kwargs['queryset'] = SubExpense.objects.none()
+
         elif db_field.name == 'supplier':
             if company:
                 kwargs['queryset'] = Supplier.objects.filter(
@@ -7726,53 +8857,6 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         if obj and obj.project_id:
             request._supplier_invoice_project_id = obj.project_id
         return form
-
-    def formfield_for_foreignkey(self, db_field, request, **kwargs):
-        if db_field.name == 'boq_item':
-            # Try to get project from request (either POST data or existing object)
-            project_id = None
-
-            # Check if we're editing an existing object
-            if request.resolver_match and hasattr(request.resolver_match, 'kwargs'):
-                object_id = request.resolver_match.kwargs.get('object_id')
-                if object_id:
-                    try:
-                        obj = SupplierInvoice.objects.get(pk=object_id)
-                        if obj.project:
-                            kwargs['queryset'] = BOQItem.objects.filter(project=obj.project)
-                        else:
-                            kwargs['queryset'] = BOQItem.objects.none()
-                    except SupplierInvoice.DoesNotExist:
-                        kwargs['queryset'] = BOQItem.objects.none()
-                else:
-                    # Adding new — can't know project yet, return empty or all
-                    kwargs['queryset'] = BOQItem.objects.none()
-            else:
-                kwargs['queryset'] = BOQItem.objects.none()
-
-        elif db_field.name == 'project':
-            # Keep your existing company scoping for project
-            company = self.get_active_company(request)
-            if company:
-                kwargs['queryset'] = Project.objects.filter(
-                    Q(company=company) | Q(company__isnull=True)
-                )
-
-        elif db_field.name == 'expense_category':
-            company = self.get_active_company(request)
-            if company:
-                kwargs['queryset'] = ExpenseCategory.objects.filter(
-                    Q(company=company) | Q(company__isnull=True)
-                )
-
-        elif db_field.name == 'supplier':
-            company = self.get_active_company(request)
-            if company:
-                kwargs['queryset'] = Supplier.objects.filter(
-                    Q(company=company) | Q(company__isnull=True)
-                )
-
-        return super().formfield_for_foreignkey(db_field, request, **kwargs)
 
     def linked_expense_display(self, obj):
         """Display linked expenses with clickable links."""
@@ -7808,18 +8892,48 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
     def fmt_amount(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{obj.amount:,.2f}</div>')
+
     fmt_amount.short_description = "Net Amount"
 
     def fmt_total(self, obj):
         return mark_safe(f'<div style="text-align:right;">{obj.total_amount:,.2f}</div>')
+
     fmt_total.short_description = "Total + VAT"
 
     def fmt_balance(self, obj):
-        balance = obj.balance_due
+        debug = (
+            f"total={obj.total_amount}, "
+            f"paid={obj.paid_amount}, "
+            f"client_net={obj.client_paid_amount}, "
+            f"client_vat={obj.client_paid_vat}, "
+            f"client_total={obj.client_paid_total}, "
+            f"balance={obj.balance_due}, "
+            f"adj_balance={obj.adjusted_balance_due}"
+        )
+        print(f"DEBUG {obj.supplier_inv_number}: {debug}")
+        balance = obj.balance_due  # Now correctly includes client payments
         if balance > 0:
             return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#c62828;">{balance:,.2f}</div>')
-        return mark_safe('<span style="color:#2e7d32; font-weight:bold;">PAID</span>')
+        return mark_safe('<span style="color:#2e7d32; font-weight:bold;">✓ PAID</span>')
+
     fmt_balance.short_description = "Balance Due"
+
+    def fmt_paid_amount(self, obj):
+        if obj.paid_amount > 0 or obj.client_paid_total > 0:
+            total_paid = obj.paid_amount + obj.client_paid_total
+            if obj.client_paid_total > 0:
+                return mark_safe(
+                    f'<div style="text-align:right; font-size:9px;">'
+                    f'<div style="color:#2e7d32;">{obj.paid_amount:,.2f}</div>'
+                    f'<div style="color:#6a1b9a; font-size:8px;">+{obj.client_paid_total:,.2f} client</div>'
+                    f'<div style="border-top:1px solid #ccc; margin-top:2px; padding-top:2px; font-weight:bold;">{total_paid:,.2f}</div>'
+                    f'</div>'
+                )
+            return mark_safe(
+                f'<div style="text-align:right;font-weight:bold;color:#2e7d32;">{obj.paid_amount:,.2f}</div>')
+        return mark_safe('<span style="color:#999;">—</span>')
+
+    fmt_paid_amount.short_description = "Paid"
 
     def status_badge(self, obj):
         colors = {
@@ -7832,6 +8946,7 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         }
         badge_class = colors.get(obj.status, 'badge-warning')
         return mark_safe(f'<span class="badge {badge_class}">{obj.status}</span>')
+
     status_badge.short_description = "Status"
 
     def days_overdue_display(self, obj):
@@ -7844,6 +8959,7 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
             return mark_safe(f'<span style="color:#f57c00; font-size:10px; font-weight:bold;">{days} days</span>')
         else:
             return mark_safe(f'<span style="color:#c62828; font-size:10px; font-weight:bold;">{days} days ⚠️</span>')
+
     days_overdue_display.short_description = "Overdue"
 
     actions = ["mark_approved", "mark_scheduled", "mark_paid", "generate_next_recurring"]
@@ -7863,7 +8979,10 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
         today = date.today()
         for inv in queryset:
             if inv.status != 'Paid':
-                inv.paid_amount = inv.total_amount
+                # Only record the direct payment portion
+                # The amount WE paid = total minus what client already paid
+                direct_paid = inv.total_amount - inv.client_paid_total
+                inv.paid_amount = direct_paid
                 inv.status = 'Paid'
                 inv.actual_payment_date = today
                 inv.save()
@@ -7891,7 +9010,7 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
             # Check if next instance already exists
             if not SupplierInvoice.objects.filter(
-                parent_invoice=inv, invoice_date=next_date
+                    parent_invoice=inv, invoice_date=next_date
             ).exists():
                 SupplierInvoice.objects.create(
                     company=inv.company,
@@ -7915,19 +9034,334 @@ class SupplierInvoiceAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
 
         self.message_user(request, f"{created} recurring invoice(s) created.")
 
+    def payment_status(self, obj):
+        if obj.status == 'Paid':
+            return mark_safe('<span style="color:green; font-weight:bold;">✓ Paid</span>')
+
+        # Use the TRUE balance (which now includes client payments)
+        if obj.balance_due <= 0:
+            return mark_safe('<span style="color:green; font-weight:bold;">✓ Paid (via Client)</span>')
+
+        if obj.balance_due < obj.total_amount * Decimal("0.1"):
+            return mark_safe('<span style="color:orange; font-weight:bold;">⚠ Partial</span>')
+
+        return mark_safe('<span style="color:red; font-weight:bold;">● Unpaid</span>')
+
+    payment_status.short_description = "Status"
+
+    def client_deductions_display(self, obj):
+        net = obj.client_paid_amount
+        if net > 0:
+            vat = obj.client_paid_vat
+            total = obj.client_paid_total
+            return mark_safe(
+                f'<div style="font-size:9px; text-align:right;">'
+                f'<div style="color:#c62828; font-weight:bold;">({net:,.2f}) net</div>'
+                f'<div style="color:#6a1b9a;">({vat:,.2f}) VAT</div>'
+                f'<div style="color:#1a237e; font-weight:bold; border-top:1px solid #ccc; margin-top:2px; padding-top:2px;">'
+                f'({total:,.2f}) total</div>'
+                f'</div>'
+            )
+        return mark_safe('<span style="color:#999;">—</span>')
+
+    client_deductions_display.short_description = "Client Paid"
+
+    def adjusted_balance_display(self, obj):
+        balance = obj.balance_due  # TRUE balance
+        direct_paid = obj.paid_amount
+        client_paid = obj.client_paid_total
+        original_total = obj.total_amount
+
+        if client_paid > 0:
+            if balance <= 0:
+                return mark_safe(
+                    f'<div style="font-size:9px; text-align:right;">'
+                    f'<div style="color:#999;">Total: {original_total:,.2f}</div>'
+                    f'<div style="color:#2e7d32;">- Direct: {direct_paid:,.2f}</div>'
+                    f'<div style="color:#6a1b9a;">- Client: {client_paid:,.2f}</div>'
+                    f'<div style="border-top:1px solid #ccc; margin-top:2px; padding-top:2px; '
+                    f'color:#2e7d32; font-weight:bold; font-size:11px;">'
+                    f'✓ {balance:,.2f}</div>'
+                    f'</div>'
+                )
+            else:
+                return mark_safe(
+                    f'<div style="font-size:9px; text-align:right;">'
+                    f'<div style="color:#999;">Total: {original_total:,.2f}</div>'
+                    f'<div style="color:#2e7d32;">- Direct: {direct_paid:,.2f}</div>'
+                    f'<div style="color:#6a1b9a;">- Client: {client_paid:,.2f}</div>'
+                    f'<div style="border-top:1px solid #ccc; margin-top:2px; padding-top:2px; '
+                    f'color:#ed6c02; font-weight:bold; font-size:11px;">'
+                    f'{balance:,.2f}</div>'
+                    f'</div>'
+                )
+
+        # No client payments - just show regular balance
+        if balance <= 0:
+            return mark_safe(f'<div style="text-align:right; color:#2e7d32; font-weight:bold;">✓ PAID</div>')
+        return mark_safe(f'<div style="text-align:right; font-weight:bold;">{balance:,.2f}</div>')
+
+    adjusted_balance_display.short_description = "Balance"
+
+    def save(self, *args, **kwargs):
+        self.vat_amount = money(self.amount * (self.vat_percent / 100))
+        self.total_amount = money(self.amount + self.vat_amount)
+        self.retention_amount = money(self.amount * (self.retention_percent / 100))
+
+        # Validate: paid_amount should not exceed (total - client_paid_total)
+        max_direct = self.total_amount - self.client_paid_total
+        if self.paid_amount > max_direct:
+            self.paid_amount = max_direct
+
+        if not self.expected_payment_date and self.due_date:
+            self.expected_payment_date = self.due_date
+        super().save(*args, **kwargs)
+        self._sync_expense()
+
 
 @admin.register(SupplierPayment)
 class SupplierPaymentAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     company_field_path = 'supplier_invoice__company'
-    list_display = ["supplier_invoice", "payment_date", "fmt_amount", "payment_method", "bank_reference"]
-    list_filter = ["payment_method", "payment_date"]
+    list_display = [
+        "supplier_invoice", "payment_date", "fmt_amount", "payment_method",
+        "paid_through_client_badge", "deduction_link", "bank_reference"
+    ]
+    list_filter = [
+        "payment_method", "payment_date", "paid_through_client",
+        "supplier_invoice__company", "supplier_invoice__supplier"
+    ]
     search_fields = ["supplier_invoice__supplier__name", "bank_reference", "reference_number"]
     date_hierarchy = "payment_date"
     autocomplete_fields = ["supplier_invoice"]
 
+    def get_urls(self):
+        urls = super().get_urls()
+        custom = [
+            path(
+                '<int:pk>/link-deduction/',
+                self.admin_site.admin_view(self.link_deduction_view),
+                name='supplierpayment_link_deduction'
+            ),
+        ]
+        return custom + urls
+
     def fmt_amount(self, obj):
         return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#2e7d32;">{obj.amount:,.2f}</div>')
+
     fmt_amount.short_description = "Amount"
+
+    def paid_through_client_badge(self, obj):
+        if obj.paid_through_client:
+            if hasattr(obj, 'client_deduction'):
+                cd = obj.client_deduction
+                inv_str = f" → {cd.invoice}" if cd.invoice else ""
+                return mark_safe(
+                    f'<span style="background:#e8f5e9; color:#2e7d32; padding:2px 8px; '
+                    f'border-radius:12px; font-size:9px; font-weight:bold;">'
+                    f'✓ Via Client{inv_str}</span>'
+                )
+            return mark_safe(
+                f'<span style="background:#fff3e0; color:#ed6c02; padding:2px 8px; '
+                f'border-radius:12px; font-size:9px; font-weight:bold;">'
+                f'⚠ Pending Link</span>'
+            )
+        return mark_safe(
+            f'<span style="background:#f5f5f5; color:#999; padding:2px 8px; '
+            f'border-radius:12px; font-size:9px;">Direct Payment</span>'
+        )
+
+    paid_through_client_badge.short_description = "Payment Route"
+
+    def deduction_link(self, obj):
+        if hasattr(obj, 'client_deduction'):
+            cd = obj.client_deduction
+            url = reverse('admin:billing_clientdeduction_change', args=[cd.pk])
+            return mark_safe(
+                f'<a href="{url}" style="color:#1a237e; font-weight:bold; font-size:10px;">'
+                f'View Deduction</a>'
+            )
+        return mark_safe('<span style="color:#999;">—</span>')
+
+    deduction_link.short_description = "Deduction"
+
+    def link_deduction_view(self, request, pk):
+        """
+        Intermediate page to link a supplier payment to a client invoice deduction.
+        Shows a form to select client, project, invoice, and enter deduction details.
+        """
+        from django.shortcuts import render, redirect
+        from django.contrib import messages
+
+        company = self.get_active_company(request)
+        payment = get_object_or_404(SupplierPayment, pk=pk)
+
+        # Prevent double-linking
+        if hasattr(payment, 'client_deduction'):
+            messages.error(request, "This payment is already linked to a client deduction.")
+            return redirect('admin:billing_supplierpayment_change', object_id=pk)
+
+        if request.method == 'POST':
+            client_id = request.POST.get('client')
+            project_id = request.POST.get('project')
+            invoice_id = request.POST.get('invoice')
+            amount = request.POST.get('amount')
+            description = request.POST.get('description', '')
+
+            errors = []
+            if not client_id:
+                errors.append("Client is required.")
+            if not project_id:
+                errors.append("Project is required.")
+            if not amount:
+                errors.append("Amount is required.")
+            else:
+                try:
+                    amount_dec = Decimal(amount)
+                    if amount_dec <= 0:
+                        errors.append("Amount must be greater than zero.")
+                    if amount_dec > payment.amount:
+                        errors.append(f"Amount cannot exceed payment amount (AED {payment.amount:,.2f}).")
+                except:
+                    errors.append("Invalid amount.")
+
+            if errors:
+                context = self._build_link_context(request, payment, company, errors=errors)
+                return render(request, 'admin/link_deduction.html', context)
+
+            # Create the deduction
+            client = Client.objects.get(pk=client_id)
+            project = Project.objects.get(pk=project_id)
+            invoice = Invoice.objects.get(pk=invoice_id) if invoice_id else None
+
+            deduction = ClientDeduction.objects.create(
+                company=company,
+                client=client,
+                project=project,
+                invoice=invoice,
+                supplier_payment=payment,
+                deduction_type='supplier_payment',
+                amount=Decimal(amount),
+                description=description or f"Supplier payment to {payment.supplier_invoice.supplier.name} via client {client.name}",
+                is_settled=True,
+            )
+
+            # Mark payment as paid through client
+            payment.paid_through_client = True
+            payment.save(update_fields=['paid_through_client'])
+
+            messages.success(
+                request,
+                f"Successfully linked payment to client deduction. "
+                f"Client {client.name} deducted AED {amount}."
+            )
+            return redirect('admin:billing_supplierpayment_change', object_id=pk)
+
+        context = self._build_link_context(request, payment, company)
+        return render(request, 'admin/link_deduction.html', context)
+
+    def _build_link_context(self, request, payment, company, errors=None):
+        """Build context for the link deduction form page."""
+
+        # Get eligible clients (same company scope)
+        clients = Client.objects.filter(
+            Q(company=company) | Q(company__isnull=True)
+        ).order_by('name')
+
+        # Get projects for the selected client (if any)
+        selected_client = request.POST.get('client') or request.GET.get('client')
+        projects = []
+        invoices = []
+        selected_project = None  # <-- FIX: Initialize here
+
+        if selected_client:
+            projects = Project.objects.filter(
+                client_id=selected_client
+            ).filter(
+                Q(company=company) | Q(company__isnull=True)
+            ).order_by('project_id_code')
+
+            selected_project = request.POST.get('project') or request.GET.get('project')
+            if selected_project:
+                invoices = Invoice.objects.filter(
+                    project_id=selected_project,
+                    inv_type='T'
+                ).exclude(is_advance_invoice=True).order_by('-inv_number')
+
+        # Pre-fill amount (default to full payment amount)
+        default_amount = payment.amount
+
+        context = {
+            **self.admin_site.each_context(request),
+            'title': f'Link to Client Deduction — {payment}',
+            'subtitle': f'Supplier: {payment.supplier_invoice.supplier.name} | Amount: AED {payment.amount:,.2f}',
+            'payment': payment,
+            'clients': clients,
+            'projects': projects,
+            'invoices': invoices,
+            'selected_client': int(selected_client) if selected_client else None,
+            'selected_project': int(selected_project) if selected_project else None,
+            'default_amount': default_amount,
+            'errors': errors or [],
+            'opts': self.model._meta,
+        }
+        return context
+
+    # Add the "Link to Client Deduction" button on the change form
+    def change_view(self, request, object_id, form_url='', extra_context=None):
+        extra_context = extra_context or {}
+        obj = self.get_object(request, object_id)
+        if obj and not hasattr(obj, 'client_deduction'):
+            extra_context['show_link_deduction'] = True
+            extra_context['link_deduction_url'] = reverse(
+                'admin:supplierpayment_link_deduction', args=[obj.pk]
+            )
+        return super().change_view(request, object_id, form_url, extra_context)
+
+    # Add to SupplierPaymentAdmin.actions
+    actions = ["mark_paid_through_client", "mark_direct_payment"]
+
+    @admin.action(description="☑️ Mark selected as Paid Through Client (requires linking)")
+    def mark_paid_through_client(self, request, queryset):
+        """Mark payments as paid through client — user must then link each one."""
+        updated = queryset.filter(paid_through_client=False).update(paid_through_client=True)
+        if updated == 1:
+            # Redirect to link page for single item
+            payment = queryset.first()
+            link_url = reverse('admin:supplierpayment_link_deduction', args=[payment.pk])
+            self.message_user(
+                request,
+                mark_safe(
+                    f'Payment marked as "Paid Through Client". '
+                    f'<a href="{link_url}" style="color:#1565c0; font-weight:bold;">'
+                    f'Click here to link to client invoice</a>'
+                ),
+                level=messages.INFO
+            )
+        else:
+            self.message_user(
+                request,
+                f'{updated} payment(s) marked as "Paid Through Client". '
+                f'Edit each payment to link it to a client invoice.',
+                level=messages.INFO
+            )
+
+    @admin.action(description="↩️ Revert to Direct Payment")
+    def mark_direct_payment(self, request, queryset):
+        """Revert payments back to direct payment status."""
+        # Can't revert if already linked to a deduction
+        linked = queryset.filter(client_deduction__isnull=False)
+        if linked.exists():
+            names = ", ".join(str(p) for p in linked[:3])
+            self.message_user(
+                request,
+                f'Cannot revert: {names} already linked to client deductions. '
+                f'Delete the deduction first.',
+                level=messages.ERROR
+            )
+            return
+        updated = queryset.filter(paid_through_client=True).update(paid_through_client=False)
+        self.message_user(request, f'{updated} payment(s) reverted to Direct Payment.')
+
 
 @admin.register(PricingProject)
 class PricingProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
@@ -7941,4 +9375,152 @@ class PricingProjectAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
     def fmt_total(self, obj):
         total = sum(item.proposed_total for item in obj.boq_items.all())
         return mark_safe(f'<div style="text-align:right;font-weight:bold;">{total:,.2f}</div>')
+
     fmt_total.short_description = "Proposed Total"
+
+
+from django import forms
+from django.contrib import admin
+from django.urls import reverse
+from django.utils.safestring import mark_safe
+
+
+class ClientDeductionForm(forms.ModelForm):
+    class Meta:
+        model = ClientDeduction
+        fields = '__all__'
+        widgets = {
+            'invoice': forms.Select(attrs={
+                'data-placeholder': 'Select project first...',
+                'style': 'width: 400px;',
+            }),
+        }
+
+
+@admin.register(ClientDeduction)
+class ClientDeductionAdmin(CompanyScopedAdminMixin, admin.ModelAdmin):
+    company_field_path = 'company'
+    form = ClientDeductionForm
+    list_display = [
+        "id", "client", "project", "invoice_link", "supplier_payment_link",
+        "fmt_amount", "deduction_type", "is_settled", "created_at"
+    ]
+    list_filter = ["company", "deduction_type", "is_settled", "client", "created_at"]
+    search_fields = ["client__name", "description", "supplier_payment__supplier_invoice__supplier__name"]
+    readonly_fields = ["company", "created_at", "updated_at"]
+
+    fieldsets = (
+        ("Deduction Details", {
+            "fields": (
+                ("client", "project"),
+                "invoice",
+                ("supplier_payment", "deduction_type"),
+                ("amount", "is_settled"),
+                "description",
+            )
+        }),
+        ("System", {
+            "fields": ("company", "created_at", "updated_at"),
+            "classes": ("collapse",)
+        }),
+    )
+
+    class Media:
+        js = (
+            'admin/js/vendor/jquery/jquery.min.js',
+            'admin/js/jquery.init.js',
+            'billing/js/client_deduction_invoice_filter.js',
+        )
+
+    def invoice_link(self, obj):
+        if obj.invoice:
+            url = reverse('admin:billing_invoice_change', args=[obj.invoice.pk])
+            return mark_safe(f'<a href="{url}">{obj.invoice}</a>')
+        return mark_safe('<span style="color:#999;">—</span>')
+
+    invoice_link.short_description = "Client Invoice"
+
+    def supplier_payment_link(self, obj):
+        if obj.supplier_payment:
+            url = reverse('admin:billing_supplierpayment_change', args=[obj.supplier_payment.pk])
+            return mark_safe(f'<a href="{url}">{obj.supplier_payment}</a>')
+        return mark_safe('<span style="color:#999;">—</span>')
+
+    supplier_payment_link.short_description = "Supplier Payment"
+
+    def fmt_amount(self, obj):
+        return mark_safe(f'<div style="text-align:right;font-weight:bold;color:#c62828;">({obj.amount:,.2f})</div>')
+
+    fmt_amount.short_description = "Amount"
+
+    def save_model(self, request, obj, form, change):
+        company = self.get_active_company(request)
+        if company and not obj.company_id:
+            obj.company = company
+        super().save_model(request, obj, form, change)
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom = [
+            path('invoice-autocomplete/', self.admin_site.admin_view(InvoiceAutocomplete.as_view()),
+                 name='clientdeduction_invoice_autocomplete'),
+        ]
+        return custom + urls
+
+    def formfield_for_foreignkey(self, db_field, request, **kwargs):
+        if db_field.name == 'invoice':
+            # Base queryset with company scoping
+            qs = Invoice.objects.filter(inv_type='T').exclude(is_advance_invoice=True)
+            company = self.get_active_company(request)
+            if company:
+                qs = qs.filter(project__company=company)
+
+            # For the fallback JS filtering, we need project info on each option
+            # We'll use a custom widget that adds data-project attributes
+            from django.forms import Select
+            from django.utils.html import format_html
+
+            class ProjectAwareSelect(Select):
+                def create_option(self, name, value, label, selected, index, subindex=None, attrs=None):
+                    option = super().create_option(name, value, label, selected, index, subindex, attrs)
+                    # Django 6+ wraps values in ModelChoiceIteratorValue — extract the raw PK
+                    pk = None
+                    if value and value != '':
+                        try:
+                            # Handle both raw strings and Django 6 ModelChoiceIteratorValue wrappers
+                            if hasattr(value, 'value'):
+                                pk = value.value
+                            else:
+                                pk = int(str(value))
+                        except (ValueError, TypeError):
+                            pk = None
+
+                        if pk:
+                            try:
+                                inv = Invoice.objects.select_related('project').get(pk=pk)
+                                option['attrs']['data-project'] = inv.project_id
+                            except Invoice.DoesNotExist:
+                                pass
+                    return option
+
+            kwargs['widget'] = ProjectAwareSelect(attrs={
+                'data-placeholder': 'Select project first...',
+                'style': 'width: 400px;',
+            })
+            kwargs['queryset'] = qs.select_related('project').order_by('-inv_number')
+
+        elif db_field.name == 'project':
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = Project.objects.filter(
+                    Q(company=company) | Q(company__isnull=True)
+                )
+
+        elif db_field.name == 'supplier_payment':
+            company = self.get_active_company(request)
+            if company:
+                kwargs['queryset'] = SupplierPayment.objects.filter(
+                    Q(supplier_invoice__company=company) | Q(supplier_invoice__company__isnull=True)
+                )
+
+        return super().formfield_for_foreignkey(db_field, request, **kwargs)

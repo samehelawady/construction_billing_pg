@@ -1,0 +1,135 @@
+{% extends "admin/base_site.html" %}
+{% load i18n admin_urls static %}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+    &rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+    &rsaquo; <a href="{% url opts|admin_urlname:'changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>
+    &rsaquo; <a href="{% url opts|admin_urlname:'change' payment.pk|admin_urlquote %}">{{ payment }}</a>
+    &rsaquo; {% translate 'Link to Client Deduction' %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+    <h1>{{ title }}</h1>
+    <p style="color:#666; margin-bottom:20px;">{{ subtitle }}</p>
+
+    {% if errors %}
+    <div class="errornote" style="margin-bottom:15px;">
+        Please correct the errors below:
+        <ul class="errorlist">
+            {% for error in errors %}
+            <li>{{ error }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+
+    <form method="post" id="link-deduction-form">
+        {% csrf_token %}
+
+        <fieldset class="module aligned">
+            <h2>Client & Project</h2>
+
+            <div class="form-row">
+                <div class="field-box">
+                    <label for="id_client" class="required">Client:</label>
+                    <select name="client" id="id_client" required
+                            onchange="this.form.submit()"
+                            style="min-width:300px; padding:6px;">
+                        <option value="">---------</option>
+                        {% for client in clients %}
+                        <option value="{{ client.pk }}"
+                            {% if selected_client == client.pk %}selected{% endif %}>
+                            {{ client.name }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                    <p class="help">Select client to load their projects</p>
+                </div>
+            </div>
+
+            {% if projects %}
+            <div class="form-row">
+                <div class="field-box">
+                    <label for="id_project" class="required">Project:</label>
+                    <select name="project" id="id_project" required
+                            onchange="this.form.submit()"
+                            style="min-width:300px; padding:6px;">
+                        <option value="">---------</option>
+                        {% for project in projects %}
+                        <option value="{{ project.pk }}"
+                            {% if selected_project == project.pk %}selected{% endif %}>
+                            {{ project.project_id_code }} — {{ project.project_name }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                    <p class="help">Select project to load invoices</p>
+                </div>
+            </div>
+            {% endif %}
+
+            {% if invoices %}
+            <div class="form-row">
+                <div class="field-box">
+                    <label for="id_invoice">Client Invoice (optional):</label>
+                    <select name="invoice" id="id_invoice"
+                            style="min-width:300px; padding:6px;">
+                        <option value="">---------</option>
+                        {% for inv in invoices %}
+                        <option value="{{ inv.pk }}">
+                            {{ inv }} — {{ inv.date }} — AED {{ inv.current_certified_net_before_vat|default:0|floatformat:2 }}
+                        </option>
+                        {% endfor %}
+                    </select>
+                    <p class="help">Select the specific invoice where this deduction appears</p>
+                </div>
+            </div>
+            {% endif %}
+        </fieldset>
+
+        <fieldset class="module aligned">
+            <h2>Deduction Details</h2>
+
+            <div class="form-row">
+                <div class="field-box">
+                    <label for="id_amount" class="required">Deduction Amount (AED):</label>
+                    <input type="number" name="amount" id="id_amount" step="0.01"
+                           value="{{ request.POST.amount|default:default_amount }}"
+                           required
+                           style="min-width:150px; padding:6px; text-align:right;">
+                    <p class="help">Max: AED {{ payment.amount|floatformat:2 }} (payment amount)</p>
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="field-box">
+                    <label for="id_description">Description:</label>
+                    <textarea name="description" id="id_description" rows="3"
+                              style="min-width:400px; padding:6px;">{{ request.POST.description|default:'' }}</textarea>
+                    <p class="help">Optional notes about this deduction</p>
+                </div>
+            </div>
+        </fieldset>
+
+        <div class="submit-row">
+            <input type="submit" value="{% translate 'Create Client Deduction Link' %}"
+                   class="default" style="background:#1a237e;">
+                        <a href="{% url 'admin:billing_supplierpayment_change' object_id=payment.pk %}"
+               class="closelink" style="margin-left:10px;">{% translate 'Cancel' %}</a>
+        </div>
+    </form>
+</div>
+
+<script>
+// Auto-submit on client/project change to load dependent dropdowns
+document.getElementById('id_client').addEventListener('change', function() {
+    document.getElementById('link-deduction-form').submit();
+});
+document.getElementById('id_project').addEventListener('change', function() {
+    document.getElementById('link-deduction-form').submit();
+});
+</script>
+{% endblock %}

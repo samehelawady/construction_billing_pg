@@ -43,6 +43,8 @@ DATA_UPLOAD_MAX_NUMBER_FIELDS = 5000
 # APPS
 # ---------------------------------------------------------------------------
 INSTALLED_APPS = [
+    'dal',
+    'dal_select2',
     'billing',
     'django.contrib.admin',
     'django.contrib.auth',

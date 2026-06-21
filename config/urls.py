@@ -4,11 +4,13 @@ from django.shortcuts import redirect
 from django.conf import settings
 from django.conf.urls.static import static
 from billing.views import switch_company # or wherever you put switch_company
+from billing.views import invoice_autocomplete
 
 urlpatterns = [
     path('', lambda request: redirect('admin:index')),  # Redirect root to admin
     path('admin/', admin.site.urls),
     path('admin/switch-company/<int:company_id>/', switch_company, name='switch_company'),
+    path('admin/billing/invoice-autocomplete/', invoice_autocomplete, name='invoice_autocomplete'),
 ]
 
 if settings.DEBUG:
